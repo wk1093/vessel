@@ -2,6 +2,9 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <memory>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -9,7 +12,25 @@
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+
 #include <pipewire/pipewire.h>
+#include <pipewire/filter.h>
+
+// Shared state between UI and Audio thread
+struct AudioState {
+    std::atomic<float> volume{1.0f};
+    std::atomic<bool> bypassed{false};
+    std::atomic<float> in_peak{0.0f};
+    std::atomic<float> out_peak{0.0f};
+
+    AudioState() = default;
+
+    // Explicitly handle the fact that atomics can't move
+    AudioState(const AudioState&) = delete;
+    AudioState& operator=(const AudioState&) = delete;
+    AudioState(AudioState&&) = delete;
+    AudioState& operator=(AudioState&&) = delete;
+};
 
 struct RackPlugin {
     std::string name;
@@ -18,21 +39,146 @@ struct RackPlugin {
     bool bypassed = false;
 };
 
+// Forward declaration of process callback
+static void on_process(void *data, struct spa_io_position *pos);
+
+static const struct pw_filter_events filter_events = {
+    PW_VERSION_FILTER_EVENTS,
+    .process = on_process,
+};
+
 struct Rack {
     std::string name;
     bool visible = true;
     
-    // PipeWire Routing State
+    // PipeWire Objects
+    struct pw_filter *filter = nullptr;
+    void *input_port = nullptr;
+    void *output_port = nullptr;
+    AudioState audio_state;
+
+    // Routing UI state
     std::string input_device_name = "None";
     std::string output_device_name = "None";
-    uint32_t input_node_id = 0;
-    uint32_t output_node_id = 0;
 
     std::vector<RackPlugin> plugins;
+
+    Rack(const std::string& name) : name(name) {
+
+    }
+
+    ~Rack() {
+        if (filter) pw_filter_destroy(filter);
+    }
+
+    void connect_to_node(const std::string& target_name, bool is_input) {
+        // In PipeWire filters, you can trigger a reconnection 
+        // by updating the metadata or using pw_filter_connect with a target.
+        // For now, let's use the simplest approach: manual linking via system call 
+        // or pw-link while we're in PoC phase.
+        
+        std::string cmd = is_input ? 
+            "pw-link \"" + target_name + "\" \"" + name + ":input\"" :
+            "pw-link \"" + name + ":output\" \"" + target_name + "\"";
+        
+        system(cmd.c_str()); 
+        // This is a "cheat" for the PoC, but it works instantly on Arch 
+        // without writing 200 lines of registry listener code.
+    }
+
+    // Initialize the PipeWire filter for this rack
+    void setup_audio(struct pw_loop *loop) {
+        // 1. Create filter
+        filter = pw_filter_new_simple(loop, name.c_str(), 
+            pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", 
+                            PW_KEY_MEDIA_CATEGORY, "Filter", 
+                            PW_KEY_NODE_AUTOCONNECT, "true", // Helps ports show up
+                            NULL),
+            &filter_events, this);
+
+        // 2. Add Ports (using MAP_BUFFERS)
+        input_port = pw_filter_add_port(filter, PW_DIRECTION_INPUT, 
+            PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+            sizeof(float), 
+            pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", 
+                            PW_KEY_PORT_NAME, "input", NULL), 
+            NULL, 0);
+
+        output_port = pw_filter_add_port(filter, PW_DIRECTION_OUTPUT, 
+            PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+            sizeof(float), 
+            pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", 
+                            PW_KEY_PORT_NAME, "output", NULL), 
+            NULL, 0);
+
+        // 3. Connect
+        if (pw_filter_connect(filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0) {
+            std::cerr << "Failed to connect filter" << std::endl;
+        }
+    }
 };
+
+// --- AUDIO THREAD CALLBACK ---
+static void on_process(void *data, struct spa_io_position *pos) {
+    Rack* rack = static_cast<Rack*>(data);
+    
+    // Use MAP_BUFFERS friendly dequeue
+    struct pw_buffer *b_in = (struct pw_buffer *)pw_filter_dequeue_buffer(rack->input_port);
+    struct pw_buffer *b_out = (struct pw_buffer *)pw_filter_dequeue_buffer(rack->output_port);
+
+    if (!b_in || !b_out) return;
+
+    float *in = (float *)b_in->buffer->datas[0].data;
+    float *out = (float *)b_out->buffer->datas[0].data;
+    
+    // Calculate samples based on chunk size
+    uint32_t n_samples = b_in->buffer->datas[0].chunk->size / sizeof(float);
+
+    float p_in = 0.0f;
+    float p_out = 0.0f;
+    float vol = rack->audio_state.volume.load();
+
+    for (uint32_t i = 0; i < n_samples; i++) {
+        float s = in[i];
+        if (std::abs(s) > p_in) p_in = std::abs(s);
+
+        if (!rack->audio_state.bypassed.load()) {
+            s *= vol;
+        }
+
+        out[i] = s;
+        if (std::abs(s) > p_out) p_out = std::abs(s);
+    }
+
+    rack->audio_state.in_peak.store(p_in);
+    rack->audio_state.out_peak.store(p_out);
+
+    pw_filter_queue_buffer(rack->input_port, b_in);
+    pw_filter_queue_buffer(rack->output_port, b_out);
+}
+
+std::vector<std::string> get_pw_ports(bool input) {
+    std::vector<std::string> ports;
+    // -i lists inputs (sources), -o lists outputs (sinks)
+    FILE* pipe = popen(input ? "pw-link -i" : "pw-link -o", "r");
+    if (!pipe) return ports;
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        std::string port = buffer;
+        port.erase(port.find_last_not_of(" \n\r\t") + 1); // trim
+        // Filter out Vessel's own ports to avoid feedback loops
+        if (port.find("Vessel") == std::string::npos) {
+            ports.push_back(port);
+        }
+    }
+    pclose(pipe);
+    return ports;
+}
 
 int main(int argc, char* argv[]) {
     pw_init(&argc, &argv);
+    struct pw_thread_loop *thread_loop = pw_thread_loop_new("VesselLoop", NULL);
+    pw_thread_loop_start(thread_loop);
 
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -54,9 +200,18 @@ int main(int argc, char* argv[]) {
     ImGui_ImplOpenGL3_Init("#version 130");
 
     // Dynamic Rack Storage
-    std::vector<Rack> racks;
+    std::vector<std::unique_ptr<Rack>> racks;
     // Initialize with one default rack
-    racks.push_back((Rack){"Main Rack", true, "None", "None", 0, 0, {{"Soundboard", true, 0.8f}, {"Compressor", true, 1.0f}}});
+    auto add_rack = [&](std::string name) {
+        auto r = std::make_unique<Rack>(name);
+        // CRITICAL: Lock the loop before touching any PipeWire objects
+        pw_thread_loop_lock(thread_loop);
+        r->setup_audio(pw_thread_loop_get_loop(thread_loop));
+        pw_thread_loop_unlock(thread_loop);
+        racks.emplace_back(std::move(r));
+    };
+
+    add_rack("Main Rack");
 
     bool show_confirm_delete = false;
     int rack_to_delete = -1;
@@ -76,11 +231,11 @@ int main(int argc, char* argv[]) {
             }
             if (ImGui::BeginMenu("Racks")) {
                 if (ImGui::MenuItem("Add New Rack")) {
-                    racks.push_back({"New Rack " + std::to_string(racks.size() + 1), true, {}});
+                    add_rack("New Rack " + std::to_string(racks.size() + 1));
                 }
                 ImGui::Separator();
                 for (auto& rack : racks) {
-                    ImGui::MenuItem(rack.name.c_str(), NULL, &rack.visible);
+                    ImGui::MenuItem(rack->name.c_str(), NULL, &rack->visible);
                 }
                 ImGui::EndMenu();
             }
@@ -89,38 +244,50 @@ int main(int argc, char* argv[]) {
 
         // --- Render Racks ---
         for (int r = 0; r < (int)racks.size(); r++) {
-            if (!racks[r].visible) continue;
+            if (!racks[r]->visible) continue;
 
-            ImGui::Begin(racks[r].name.c_str(), &racks[r].visible);
+            ImGui::Begin(racks[r]->name.c_str(), &racks[r]->visible);
+
+            float in_val = racks[r]->audio_state.in_peak.load();
+            float out_val = racks[r]->audio_state.out_peak.load();
+            ImGui::Text("IN "); ImGui::SameLine(); ImGui::ProgressBar(in_val, ImVec2(-1, 12), "");
+            ImGui::Text("OUT"); ImGui::SameLine(); ImGui::ProgressBar(out_val, ImVec2(-1, 12), "");
+            float vol = racks[r]->audio_state.volume.load();
+            if (ImGui::SliderFloat("Master Gain", &vol, 0.0f, 2.0f)) {
+                racks[r]->audio_state.volume.store(vol);
+            }
+            ImGui::Separator();
 
             if (ImGui::CollapsingHeader("Rack Configuration", ImGuiTreeNodeFlags_DefaultOpen)) {
                 ImGui::Indent();
 
                 // Input Selection
-                if (ImGui::BeginCombo("Input Source", racks[r].input_device_name.c_str())) {
+                if (ImGui::BeginCombo("Input Source", racks[r]->input_device_name.c_str())) {
                     // In a real version, you'd iterate over found PipeWire nodes here
                     if (ImGui::Selectable("System Microphone")) { 
-                        racks[r].input_device_name = "System Microphone"; 
+                        racks[r]->input_device_name = "System Microphone"; 
                     }
                     ImGui::EndCombo();
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Intercept In")) {
                     // TODO: Logic to link all outputs of selected node to this rack's input
-                    std::cout << "Intercepting Input for " << racks[r].name << std::endl;
+                    std::cout << "Intercepting Input for " << racks[r]->name << std::endl;
+                    racks[r]->connect_to_node(racks[r]->input_device_name, true);
                 }
 
                 // Output Selection
-                if (ImGui::BeginCombo("Output Sink", racks[r].output_device_name.c_str())) {
+                if (ImGui::BeginCombo("Output Sink", racks[r]->output_device_name.c_str())) {
                     if (ImGui::Selectable("Built-in Audio Analog Stereo")) { 
-                        racks[r].output_device_name = "Built-in Audio Analog Stereo"; 
+                        racks[r]->output_device_name = "Built-in Audio Analog Stereo"; 
                     }
                     ImGui::EndCombo();
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Intercept Out")) {
                     // TODO: Logic to link this rack's output to the selected node's input
-                    std::cout << "Intercepting Output for " << racks[r].name << std::endl;
+                    std::cout << "Intercepting Output for " << racks[r]->name << std::endl;
+                    racks[r]->connect_to_node(racks[r]->output_device_name, false);
                 }
 
                 ImGui::Unindent();
@@ -132,9 +299,9 @@ int main(int argc, char* argv[]) {
                     int* data = (int*)payload->Data;
                     int src_rack = data[0], src_idx = data[1];
 
-                    RackPlugin moved_plugin = racks[src_rack].plugins[src_idx];
-                    racks[src_rack].plugins.erase(racks[src_rack].plugins.begin() + src_idx);
-                    racks[r].plugins.push_back(moved_plugin);
+                    RackPlugin moved_plugin = racks[src_rack]->plugins[src_idx];
+                    racks[src_rack]->plugins.erase(racks[src_rack]->plugins.begin() + src_idx);
+                    racks[r]->plugins.push_back(moved_plugin);
                 }
                 ImGui::EndDragDropTarget();
             }
@@ -148,8 +315,8 @@ int main(int argc, char* argv[]) {
                 ImGui::EndPopup();
             }
 
-            for (int p = 0; p < (int)racks[r].plugins.size(); p++) {
-                auto& plugin = racks[r].plugins[p];
+            for (int p = 0; p < (int)racks[r]->plugins.size(); p++) {
+                auto& plugin = racks[r]->plugins[p];
                 ImGui::PushID(p);
 
                 // --- Custom Header with Bypass Button ---
@@ -182,10 +349,10 @@ int main(int argc, char* argv[]) {
                         int* data = (int*)payload->Data;
                         int src_rack = data[0], src_idx = data[1];
 
-                        RackPlugin moved_plugin = racks[src_rack].plugins[src_idx];
+                        RackPlugin moved_plugin = racks[src_rack]->plugins[src_idx];
                         
                         // Erase from old position
-                        racks[src_rack].plugins.erase(racks[src_rack].plugins.begin() + src_idx);
+                        racks[src_rack]->plugins.erase(racks[src_rack]->plugins.begin() + src_idx);
                         
                         // If moving within same rack and moving "down", adjust index
                         int insert_at = p;
@@ -193,7 +360,7 @@ int main(int argc, char* argv[]) {
                             // No adjustment needed because erase shifted items up
                         }
                         
-                        racks[r].plugins.insert(racks[r].plugins.begin() + insert_at, moved_plugin);
+                        racks[r]->plugins.insert(racks[r]->plugins.begin() + insert_at, moved_plugin);
                     }
                     ImGui::EndDragDropTarget();
                 }
@@ -202,7 +369,7 @@ int main(int argc, char* argv[]) {
                     ImGui::Indent();
                     ImGui::SliderFloat("Volume", &plugin.volume, 0.0f, 1.0f);
                     if (ImGui::Button("Remove Plugin")) {
-                         racks[r].plugins.erase(racks[r].plugins.begin() + p);
+                         racks[r]->plugins.erase(racks[r]->plugins.begin() + p);
                     }
                     ImGui::Unindent();
                 }
@@ -210,7 +377,7 @@ int main(int argc, char* argv[]) {
             }
 
             if (ImGui::Button("+ Add Plugin")) {
-                racks[r].plugins.push_back({"New Plugin", true, 1.0f});
+                racks[r]->plugins.push_back({"New Plugin", true, 1.0f});
             }
 
             ImGui::End();
@@ -258,6 +425,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup
+    pw_thread_loop_stop(thread_loop);
+    pw_thread_loop_destroy(thread_loop);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
