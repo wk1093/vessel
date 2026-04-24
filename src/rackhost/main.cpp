@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -7,11 +8,13 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <vector>
 
 #include <pipewire/filter.h>
 #include <pipewire/pipewire.h>
@@ -21,6 +24,8 @@
 namespace {
 std::atomic<bool> g_running{true};
 
+constexpr uint32_t kPluginTypeSineMixer = 1;
+
 struct AudioState {
     std::atomic<float> volume{1.0f};
     std::atomic<bool> bypassed{false};
@@ -28,12 +33,90 @@ struct AudioState {
     std::atomic<float> out_peak{0.0f};
 };
 
+struct PluginParamSpec {
+    uint32_t id;
+    const char* name;
+    vessel::ParamWidget widget;
+    float min_value;
+    float max_value;
+    float default_value;
+};
+
+class RackPlugin {
+public:
+    virtual ~RackPlugin() = default;
+
+    virtual uint32_t type_id() const = 0;
+    virtual const char* display_name() const = 0;
+    virtual float process_sample(float in, float sample_rate) = 0;
+    virtual std::vector<PluginParamSpec> param_specs() const = 0;
+    virtual float get_param(uint32_t param_id) const = 0;
+    virtual void set_param(uint32_t param_id, float value) = 0;
+};
+
+class SineMixerPlugin final : public RackPlugin {
+public:
+    static constexpr uint32_t kParamInputVol = 1;
+    static constexpr uint32_t kParamSineVol = 2;
+
+    uint32_t type_id() const override { return kPluginTypeSineMixer; }
+    const char* display_name() const override { return "Sine Mixer (Test)"; }
+
+    float process_sample(float in, float sample_rate) override {
+        const float input_vol = input_vol_.load(std::memory_order_relaxed);
+        const float sine_vol = sine_vol_.load(std::memory_order_relaxed);
+
+        const float sine = std::sin(phase_);
+        phase_ += (2.0f * 3.14159265358979323846f * 220.0f) / std::max(sample_rate, 1.0f);
+        if (phase_ > 2.0f * 3.14159265358979323846f) {
+            phase_ -= 2.0f * 3.14159265358979323846f;
+        }
+
+        return in * input_vol + sine * sine_vol;
+    }
+
+    std::vector<PluginParamSpec> param_specs() const override {
+        return {
+            {kParamInputVol, "Input Vol", vessel::ParamWidget::SLIDER, 0.0f, 2.0f, 1.0f},
+            {kParamSineVol, "Sine Vol", vessel::ParamWidget::SLIDER, 0.0f, 1.0f, 0.0f},
+        };
+    }
+
+    float get_param(uint32_t param_id) const override {
+        if (param_id == kParamInputVol) return input_vol_.load(std::memory_order_relaxed);
+        if (param_id == kParamSineVol) return sine_vol_.load(std::memory_order_relaxed);
+        return 0.0f;
+    }
+
+    void set_param(uint32_t param_id, float value) override {
+        if (param_id == kParamInputVol) {
+            input_vol_.store(std::clamp(value, 0.0f, 2.0f), std::memory_order_relaxed);
+        } else if (param_id == kParamSineVol) {
+            sine_vol_.store(std::clamp(value, 0.0f, 1.0f), std::memory_order_relaxed);
+        }
+    }
+
+private:
+    std::atomic<float> input_vol_{1.0f};
+    std::atomic<float> sine_vol_{0.0f};
+    float phase_ = 0.0f;
+};
+
+struct PluginInstance {
+    uint32_t instance_id = 0;
+    std::unique_ptr<RackPlugin> plugin;
+};
+
 struct RunnerRack {
-    std::string name;
     struct pw_filter* filter = nullptr;
-    void* input_ports[2] = {nullptr, nullptr};   // FL, FR
-    void* output_ports[2] = {nullptr, nullptr};  // FL, FR
+    void* input_ports[2] = {nullptr, nullptr};
+    void* output_ports[2] = {nullptr, nullptr};
+
     AudioState audio_state;
+    std::vector<PluginInstance> plugins;
+    uint32_t next_plugin_instance_id = 1;
+
+    std::vector<uint8_t> rx_buffer;
 
     ~RunnerRack() {
         if (filter != nullptr) {
@@ -47,8 +130,69 @@ void signal_handler(int) {
     g_running.store(false);
 }
 
-static void on_process(void* data, struct spa_io_position*) {
+RackPlugin* find_plugin(RunnerRack& rack, uint32_t instance_id) {
+    for (auto& instance : rack.plugins) {
+        if (instance.instance_id == instance_id) {
+            return instance.plugin.get();
+        }
+    }
+    return nullptr;
+}
+
+template <typename T>
+void send_ipc(int client_fd, const T& msg) {
+    if (client_fd < 0) return;
+    const ssize_t n = ::send(client_fd, &msg, sizeof(T), MSG_NOSIGNAL);
+    if (n <= 0) {
+        // Client disconnect is handled by the select loop; ignore send errors here.
+    }
+}
+
+void send_plugin_catalog(int client_fd) {
+    vessel::MsgPluginCatalogEntry entry;
+    entry.plugin_type_id = kPluginTypeSineMixer;
+    std::strncpy(entry.name, "Sine Mixer (Test)", vessel::kMaxPluginNameLen);
+    entry.name[vessel::kMaxPluginNameLen] = '\0';
+    entry.is_last = 1;
+    send_ipc(client_fd, entry);
+}
+
+void send_plugin_params(int client_fd, uint32_t instance_id, RackPlugin& plugin) {
+    const std::vector<PluginParamSpec> specs = plugin.param_specs();
+    for (size_t i = 0; i < specs.size(); ++i) {
+        const PluginParamSpec& spec = specs[i];
+        vessel::MsgPluginParamDesc msg;
+        msg.instance_id = instance_id;
+        msg.param_id = spec.id;
+        msg.widget = spec.widget;
+        msg.min_value = spec.min_value;
+        msg.max_value = spec.max_value;
+        msg.value = plugin.get_param(spec.id);
+        std::strncpy(msg.name, spec.name, vessel::kMaxParamNameLen);
+        msg.name[vessel::kMaxParamNameLen] = '\0';
+        msg.is_last = (i + 1 == specs.size()) ? 1 : 0;
+        send_ipc(client_fd, msg);
+    }
+}
+
+std::unique_ptr<RackPlugin> create_plugin(uint32_t plugin_type_id) {
+    if (plugin_type_id == kPluginTypeSineMixer) {
+        return std::make_unique<SineMixerPlugin>();
+    }
+    return nullptr;
+}
+
+static void on_process(void* data, struct spa_io_position* position) {
     RunnerRack* rack = static_cast<RunnerRack*>(data);
+
+    float sample_rate = 48000.0f;
+    if (position && position->clock.rate.denom != 0) {
+        const float maybe_rate = static_cast<float>(position->clock.rate.num)
+            / static_cast<float>(position->clock.rate.denom);
+        if (maybe_rate > 1000.0f) {
+            sample_rate = maybe_rate;
+        }
+    }
 
     const float vol = rack->audio_state.volume.load(std::memory_order_relaxed);
     const bool bypassed = rack->audio_state.bypassed.load(std::memory_order_relaxed);
@@ -56,7 +200,7 @@ static void on_process(void* data, struct spa_io_position*) {
     float p_out = 0.0f;
 
     for (int ch = 0; ch < 2; ++ch) {
-        auto* b_in  = static_cast<struct pw_buffer*>(pw_filter_dequeue_buffer(rack->input_ports[ch]));
+        auto* b_in = static_cast<struct pw_buffer*>(pw_filter_dequeue_buffer(rack->input_ports[ch]));
         auto* b_out = static_cast<struct pw_buffer*>(pw_filter_dequeue_buffer(rack->output_ports[ch]));
 
         if (!b_out) {
@@ -67,32 +211,38 @@ static void on_process(void* data, struct spa_io_position*) {
         auto& d_out = b_out->buffer->datas[0];
 
         if (!b_in) {
-            // No input connected — output silence so we don't corrupt downstream nodes.
             if (d_out.data) std::memset(d_out.data, 0, d_out.maxsize);
             d_out.chunk->offset = 0;
             d_out.chunk->stride = sizeof(float);
-            d_out.chunk->size   = d_out.maxsize;
+            d_out.chunk->size = d_out.maxsize;
             pw_filter_queue_buffer(rack->output_ports[ch], b_out);
             continue;
         }
 
         auto& d_in = b_in->buffer->datas[0];
-        const float*   in  = static_cast<float*>(d_in.data);
-        float*         out = static_cast<float*>(d_out.data);
+        const float* in = static_cast<float*>(d_in.data);
+        float* out = static_cast<float*>(d_out.data);
         const uint32_t n_samples = d_in.chunk->size / sizeof(float);
 
         for (uint32_t i = 0; i < n_samples; ++i) {
             float s = in[i];
             p_in = std::max(p_in, std::fabs(s));
-            if (!bypassed) s *= vol;
+
+            if (!bypassed) {
+                s *= vol;
+            }
+
+            for (auto& instance : rack->plugins) {
+                s = instance.plugin->process_sample(s, sample_rate);
+            }
+
             out[i] = s;
             p_out = std::max(p_out, std::fabs(s));
         }
 
-        // Tell PipeWire exactly how many valid bytes are in the output buffer.
         d_out.chunk->offset = 0;
         d_out.chunk->stride = sizeof(float);
-        d_out.chunk->size   = n_samples * sizeof(float);
+        d_out.chunk->size = n_samples * sizeof(float);
 
         pw_filter_queue_buffer(rack->input_ports[ch], b_in);
         pw_filter_queue_buffer(rack->output_ports[ch], b_out);
@@ -137,40 +287,150 @@ bool setup_audio(RunnerRack& rack, pw_loop* loop, uint32_t rack_id) {
     }
 
     rack.input_ports[0] = pw_filter_add_port(
-        rack.filter, PW_DIRECTION_INPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float),
-        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono",
-                          PW_KEY_PORT_NAME, "input_FL",
-                          "audio.channel", "FL", nullptr),
-        nullptr, 0);
+        rack.filter,
+        PW_DIRECTION_INPUT,
+        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+        sizeof(float),
+        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", PW_KEY_PORT_NAME, "input_FL", "audio.channel", "FL", nullptr),
+        nullptr,
+        0);
 
     rack.input_ports[1] = pw_filter_add_port(
-        rack.filter, PW_DIRECTION_INPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float),
-        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono",
-                          PW_KEY_PORT_NAME, "input_FR",
-                          "audio.channel", "FR", nullptr),
-        nullptr, 0);
+        rack.filter,
+        PW_DIRECTION_INPUT,
+        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+        sizeof(float),
+        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", PW_KEY_PORT_NAME, "input_FR", "audio.channel", "FR", nullptr),
+        nullptr,
+        0);
 
     rack.output_ports[0] = pw_filter_add_port(
-        rack.filter, PW_DIRECTION_OUTPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float),
-        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono",
-                          PW_KEY_PORT_NAME, "output_FL",
-                          "audio.channel", "FL", nullptr),
-        nullptr, 0);
+        rack.filter,
+        PW_DIRECTION_OUTPUT,
+        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+        sizeof(float),
+        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", PW_KEY_PORT_NAME, "output_FL", "audio.channel", "FL", nullptr),
+        nullptr,
+        0);
 
     rack.output_ports[1] = pw_filter_add_port(
-        rack.filter, PW_DIRECTION_OUTPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float),
-        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono",
-                          PW_KEY_PORT_NAME, "output_FR",
-                          "audio.channel", "FR", nullptr),
-        nullptr, 0);
+        rack.filter,
+        PW_DIRECTION_OUTPUT,
+        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+        sizeof(float),
+        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", PW_KEY_PORT_NAME, "output_FR", "audio.channel", "FR", nullptr),
+        nullptr,
+        0);
 
-    if (!rack.input_ports[0] || !rack.input_ports[1]
-        || !rack.output_ports[0] || !rack.output_ports[1]) {
+    if (!rack.input_ports[0] || !rack.input_ports[1] || !rack.output_ports[0] || !rack.output_ports[1]) {
         return false;
     }
 
     return pw_filter_connect(rack.filter, PW_FILTER_FLAG_RT_PROCESS, nullptr, 0) >= 0;
 }
+
+bool read_client_bytes(RunnerRack& rack, int& client_fd) {
+    if (client_fd < 0) return true;
+
+    uint8_t chunk[1024];
+    while (true) {
+        const ssize_t n = ::recv(client_fd, chunk, sizeof(chunk), MSG_DONTWAIT);
+        if (n > 0) {
+            rack.rx_buffer.insert(rack.rx_buffer.end(), chunk, chunk + n);
+            continue;
+        }
+        if (n == 0) {
+            ::close(client_fd);
+            client_fd = -1;
+            rack.rx_buffer.clear();
+            return false;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return true;
+        }
+        ::close(client_fd);
+        client_fd = -1;
+        rack.rx_buffer.clear();
+        return false;
+    }
+}
+
+void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loop) {
+    while (rack.rx_buffer.size() >= sizeof(vessel::MsgHeader)) {
+        const auto* hdr = reinterpret_cast<const vessel::MsgHeader*>(rack.rx_buffer.data());
+        const size_t frame_size = hdr->size;
+        if (frame_size < sizeof(vessel::MsgHeader)) {
+            rack.rx_buffer.clear();
+            return;
+        }
+        if (rack.rx_buffer.size() < frame_size) {
+            return;
+        }
+
+        const uint8_t* frame = rack.rx_buffer.data();
+
+        if (hdr->type == vessel::MsgType::SET_GAIN && frame_size == sizeof(vessel::MsgSetGain)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgSetGain*>(frame);
+            rack.audio_state.volume.store(msg->gain, std::memory_order_relaxed);
+        } else if (hdr->type == vessel::MsgType::SET_BYPASS && frame_size == sizeof(vessel::MsgSetBypass)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgSetBypass*>(frame);
+            rack.audio_state.bypassed.store(msg->bypassed != 0, std::memory_order_relaxed);
+        } else if (hdr->type == vessel::MsgType::REQ_PLUGIN_CATALOG && frame_size == sizeof(vessel::MsgReqPluginCatalog)) {
+            send_plugin_catalog(client_fd);
+        } else if (hdr->type == vessel::MsgType::ADD_PLUGIN && frame_size == sizeof(vessel::MsgAddPlugin)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgAddPlugin*>(frame);
+            std::unique_ptr<RackPlugin> plugin = create_plugin(msg->plugin_type_id);
+            if (plugin) {
+                const uint32_t instance_id = rack.next_plugin_instance_id++;
+                const uint32_t type_id = plugin->type_id();
+                const char* display_name = plugin->display_name();
+
+                pw_thread_loop_lock(thread_loop);
+                rack.plugins.push_back({instance_id, std::move(plugin)});
+                RackPlugin* added = find_plugin(rack, instance_id);
+                if (added) {
+                    vessel::MsgPluginInstanceAdded added_msg;
+                    added_msg.instance_id = instance_id;
+                    added_msg.plugin_type_id = type_id;
+                    std::strncpy(added_msg.name, display_name, vessel::kMaxPluginNameLen);
+                    added_msg.name[vessel::kMaxPluginNameLen] = '\0';
+                    send_ipc(client_fd, added_msg);
+                    send_plugin_params(client_fd, instance_id, *added);
+                }
+                pw_thread_loop_unlock(thread_loop);
+            }
+        } else if (hdr->type == vessel::MsgType::REQ_PLUGIN_PARAMS && frame_size == sizeof(vessel::MsgReqPluginParams)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgReqPluginParams*>(frame);
+            pw_thread_loop_lock(thread_loop);
+            RackPlugin* plugin = find_plugin(rack, msg->instance_id);
+            if (plugin) {
+                send_plugin_params(client_fd, msg->instance_id, *plugin);
+            }
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::SET_PLUGIN_PARAM && frame_size == sizeof(vessel::MsgSetPluginParam)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgSetPluginParam*>(frame);
+            pw_thread_loop_lock(thread_loop);
+            RackPlugin* plugin = find_plugin(rack, msg->instance_id);
+            if (plugin) {
+                plugin->set_param(msg->param_id, msg->value);
+            }
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::REMOVE_PLUGIN && frame_size == sizeof(vessel::MsgRemovePlugin)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgRemovePlugin*>(frame);
+            pw_thread_loop_lock(thread_loop);
+            rack.plugins.erase(
+                std::remove_if(
+                    rack.plugins.begin(),
+                    rack.plugins.end(),
+                    [&](const PluginInstance& p) { return p.instance_id == msg->instance_id; }),
+                rack.plugins.end());
+            pw_thread_loop_unlock(thread_loop);
+        }
+
+        rack.rx_buffer.erase(rack.rx_buffer.begin(), rack.rx_buffer.begin() + static_cast<long>(frame_size));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -209,17 +469,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // --- Unix Domain Socket Server ---
     int server_fd = -1;
     int client_fd = -1;
     const std::string sock_path = vessel::socket_path_by_id(rack_id);
-    ::unlink(sock_path.c_str());  // remove stale socket from a previous crash
+    ::unlink(sock_path.c_str());
 
     server_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd >= 0) {
         struct sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
-        ::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+        std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
         if (::bind(server_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0
             && ::listen(server_fd, 4) == 0) {
             ::fcntl(server_fd, F_SETFL, O_NONBLOCK);
@@ -229,78 +488,54 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // --- Main idle loop (select-based, 10 ms max latency per iteration) ---
     auto last_peak_send = std::chrono::steady_clock::now();
 
     while (g_running.load(std::memory_order_relaxed)) {
         fd_set rfds;
         FD_ZERO(&rfds);
         int maxfd = -1;
-        if (server_fd >= 0) { FD_SET(server_fd, &rfds); maxfd = std::max(maxfd, server_fd); }
-        if (client_fd >= 0) { FD_SET(client_fd, &rfds); maxfd = std::max(maxfd, client_fd); }
+        if (server_fd >= 0) {
+            FD_SET(server_fd, &rfds);
+            maxfd = std::max(maxfd, server_fd);
+        }
+        if (client_fd >= 0) {
+            FD_SET(client_fd, &rfds);
+            maxfd = std::max(maxfd, client_fd);
+        }
 
-        struct timeval tv{0, 10000};  // 10 ms
+        struct timeval tv{0, 10000};
         const int sel = ::select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
         if (sel < 0) continue;
 
         if (sel > 0) {
-            // Accept a new GUI connection (replaces any previously connected client).
             if (server_fd >= 0 && FD_ISSET(server_fd, &rfds)) {
                 const int new_fd = ::accept(server_fd, nullptr, nullptr);
                 if (new_fd >= 0) {
                     if (client_fd >= 0) ::close(client_fd);
                     client_fd = new_fd;
+                    rack.rx_buffer.clear();
                     ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
                 }
             }
 
-            // Drain incoming control messages.
             if (client_fd >= 0 && FD_ISSET(client_fd, &rfds)) {
-                while (true) {
-                    vessel::MsgHeader hdr{};
-                    const ssize_t n = ::recv(client_fd, &hdr, sizeof(hdr), MSG_DONTWAIT);
-                    if (n == 0) {
-                        // GUI disconnected cleanly.
-                        ::close(client_fd);
-                        client_fd = -1;
-                        break;
-                    }
-                    if (n < static_cast<ssize_t>(sizeof(hdr))) {
-                        break;  // EAGAIN or incomplete header — try again next iteration.
-                    }
-
-                    const uint8_t payload_size = hdr.size - static_cast<uint8_t>(sizeof(hdr));
-
-                    if (hdr.type == vessel::MsgType::SET_GAIN
-                        && payload_size == sizeof(vessel::MsgSetGain::gain)) {
-                        float gain = 1.0f;
-                        if (::recv(client_fd, &gain, sizeof(gain), MSG_DONTWAIT) == sizeof(gain)) {
-                            rack.audio_state.volume.store(gain, std::memory_order_relaxed);
-                        }
-                    } else if (hdr.type == vessel::MsgType::SET_BYPASS
-                               && payload_size == sizeof(vessel::MsgSetBypass::bypassed)) {
-                        uint8_t val = 0;
-                        if (::recv(client_fd, &val, sizeof(val), MSG_DONTWAIT) == sizeof(val)) {
-                            rack.audio_state.bypassed.store(val != 0, std::memory_order_relaxed);
-                        }
-                    }
+                if (read_client_bytes(rack, client_fd)) {
+                    handle_messages(rack, client_fd, thread_loop);
                 }
             }
         }
 
-        // Send peak levels to the GUI roughly every 50 ms.
         const auto now = std::chrono::steady_clock::now();
         if (client_fd >= 0
             && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_peak_send).count() >= 50) {
             vessel::MsgPeakLevels msg;
-            msg.in_peak  = rack.audio_state.in_peak.exchange(0.0f, std::memory_order_relaxed);
+            msg.in_peak = rack.audio_state.in_peak.exchange(0.0f, std::memory_order_relaxed);
             msg.out_peak = rack.audio_state.out_peak.exchange(0.0f, std::memory_order_relaxed);
-            ::send(client_fd, &msg, sizeof(msg), MSG_NOSIGNAL);
+            send_ipc(client_fd, msg);
             last_peak_send = now;
         }
     }
 
-    // --- Cleanup ---
     if (client_fd >= 0) ::close(client_fd);
     if (server_fd >= 0) {
         ::close(server_fd);

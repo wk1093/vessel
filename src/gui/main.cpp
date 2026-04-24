@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
@@ -22,11 +24,26 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 
-struct RackPlugin {
+struct RackPluginType {
+    uint32_t plugin_type_id = 0;
+    std::string name;
+};
+
+struct RackPluginParam {
+    uint32_t param_id = 0;
+    vessel::ParamWidget widget = vessel::ParamWidget::SLIDER;
+    std::string name;
+    float min_value = 0.0f;
+    float max_value = 1.0f;
+    float value = 0.0f;
+};
+
+struct RackPluginInstance {
+    uint32_t instance_id = 0;
+    uint32_t plugin_type_id = 0;
     std::string name;
     bool is_open = true;
-    float volume = 1.0f;
-    bool bypassed = false;
+    std::vector<RackPluginParam> params;
 };
 
 struct Rack {
@@ -40,10 +57,13 @@ struct Rack {
     float master_gain = 1.0f;
     bool bypassed_ui = false;
 
-    float in_peak  = 0.0f;
+    float in_peak = 0.0f;
     float out_peak = 0.0f;
 
-    std::vector<RackPlugin> plugins;
+    bool open_plugin_browser = false;
+    std::vector<RackPluginType> available_plugins;
+    std::vector<RackPluginInstance> plugins;
+    std::vector<uint8_t> rx_buffer;
 
     ~Rack() {
         if (sock_fd >= 0) {
@@ -57,9 +77,7 @@ pid_t spawn_runner(const std::string& runner_binary, uint32_t id) {
     pid_t pid = fork();
     if (pid == 0) {
         const std::string id_str = std::to_string(id);
-        execl(runner_binary.c_str(), runner_binary.c_str(),
-              "--id", id_str.c_str(),
-              nullptr);
+        execl(runner_binary.c_str(), runner_binary.c_str(), "--id", id_str.c_str(), nullptr);
         _exit(127);
     }
     return pid;
@@ -109,11 +127,12 @@ void try_connect_socket(Rack& rack) {
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     const std::string path = vessel::socket_path_by_id(rack.id);
-    ::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
         ::fcntl(fd, F_SETFL, O_NONBLOCK);
         rack.sock_fd = fd;
+        rack.rx_buffer.clear();
     } else {
         ::close(fd);
     }
@@ -129,42 +148,138 @@ void send_ipc(Rack& rack, const T& msg) {
     }
 }
 
+RackPluginInstance* find_plugin_instance(Rack& rack, uint32_t instance_id) {
+    for (auto& plugin : rack.plugins) {
+        if (plugin.instance_id == instance_id) {
+            return &plugin;
+        }
+    }
+    return nullptr;
+}
+
 void drain_ipc(Rack& rack) {
     if (rack.sock_fd < 0) return;
-    vessel::MsgPeakLevels msg{};
-    ssize_t n;
-    while ((n = ::recv(rack.sock_fd, &msg, sizeof(msg), MSG_DONTWAIT)) == sizeof(msg)) {
-        rack.in_peak  = std::max(rack.in_peak,  msg.in_peak);
-        rack.out_peak = std::max(rack.out_peak, msg.out_peak);
-    }
-    if (n == 0) {
+
+    uint8_t chunk[1024];
+    while (true) {
+        const ssize_t n = ::recv(rack.sock_fd, chunk, sizeof(chunk), MSG_DONTWAIT);
+        if (n > 0) {
+            rack.rx_buffer.insert(rack.rx_buffer.end(), chunk, chunk + n);
+            continue;
+        }
+
+        if (n == 0) {
+            ::close(rack.sock_fd);
+            rack.sock_fd = -1;
+            rack.rx_buffer.clear();
+            return;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        }
+
         ::close(rack.sock_fd);
         rack.sock_fd = -1;
+        rack.rx_buffer.clear();
+        return;
+    }
+
+    while (rack.rx_buffer.size() >= sizeof(vessel::MsgHeader)) {
+        const auto* hdr = reinterpret_cast<const vessel::MsgHeader*>(rack.rx_buffer.data());
+        const size_t frame_size = hdr->size;
+
+        if (frame_size < sizeof(vessel::MsgHeader)) {
+            rack.rx_buffer.clear();
+            return;
+        }
+        if (rack.rx_buffer.size() < frame_size) {
+            return;
+        }
+
+        const uint8_t* frame = rack.rx_buffer.data();
+
+        if (hdr->type == vessel::MsgType::PEAK_LEVELS && frame_size == sizeof(vessel::MsgPeakLevels)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgPeakLevels*>(frame);
+            rack.in_peak = std::max(rack.in_peak, msg->in_peak);
+            rack.out_peak = std::max(rack.out_peak, msg->out_peak);
+        } else if (hdr->type == vessel::MsgType::PLUGIN_CATALOG_ENTRY
+                   && frame_size == sizeof(vessel::MsgPluginCatalogEntry)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgPluginCatalogEntry*>(frame);
+            bool exists = false;
+            for (const auto& existing : rack.available_plugins) {
+                if (existing.plugin_type_id == msg->plugin_type_id) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                rack.available_plugins.push_back({msg->plugin_type_id, msg->name});
+            }
+        } else if (hdr->type == vessel::MsgType::PLUGIN_INSTANCE_ADDED
+                   && frame_size == sizeof(vessel::MsgPluginInstanceAdded)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgPluginInstanceAdded*>(frame);
+            if (!find_plugin_instance(rack, msg->instance_id)) {
+                RackPluginInstance plugin;
+                plugin.instance_id = msg->instance_id;
+                plugin.plugin_type_id = msg->plugin_type_id;
+                plugin.name = msg->name;
+                rack.plugins.push_back(std::move(plugin));
+            }
+        } else if (hdr->type == vessel::MsgType::PLUGIN_PARAM_DESC
+                   && frame_size == sizeof(vessel::MsgPluginParamDesc)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgPluginParamDesc*>(frame);
+            RackPluginInstance* plugin = find_plugin_instance(rack, msg->instance_id);
+            if (plugin) {
+                RackPluginParam* param_ptr = nullptr;
+                for (auto& existing : plugin->params) {
+                    if (existing.param_id == msg->param_id) {
+                        param_ptr = &existing;
+                        break;
+                    }
+                }
+                if (!param_ptr) {
+                    plugin->params.push_back({});
+                    param_ptr = &plugin->params.back();
+                }
+                param_ptr->param_id = msg->param_id;
+                param_ptr->widget = msg->widget;
+                param_ptr->name = msg->name;
+                param_ptr->min_value = msg->min_value;
+                param_ptr->max_value = msg->max_value;
+                param_ptr->value = msg->value;
+            }
+        }
+
+        rack.rx_buffer.erase(rack.rx_buffer.begin(), rack.rx_buffer.begin() + static_cast<long>(frame_size));
     }
 }
 
 static void draw_level_meter(const char* label, float level) {
-    const float width   = ImGui::GetContentRegionAvail().x - 36.0f;
-    const float height  = 10.0f;
-    const ImVec2 pos    = ImGui::GetCursorScreenPos();
-    ImDrawList*  draw   = ImGui::GetWindowDrawList();
+    const float width = ImGui::GetContentRegionAvail().x - 36.0f;
+    const float height = 10.0f;
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
 
     draw->AddRectFilled(pos, {pos.x + width, pos.y + height}, IM_COL32(35, 35, 35, 255), 2.0f);
 
     const float filled = std::min(level, 1.0f) * width;
     if (filled > 0.0f) {
         const float g_end = std::min(filled, 0.70f * width);
-        if (g_end > 0)
+        if (g_end > 0) {
             draw->AddRectFilled(pos, {pos.x + g_end, pos.y + height}, IM_COL32(50, 200, 50, 255), 2.0f);
+        }
 
         const float y_start = 0.70f * width;
-        const float y_end   = std::min(filled, 0.90f * width);
-        if (y_end > y_start)
+        const float y_end = std::min(filled, 0.90f * width);
+        if (y_end > y_start) {
             draw->AddRectFilled({pos.x + y_start, pos.y}, {pos.x + y_end, pos.y + height}, IM_COL32(220, 200, 30, 255));
+        }
 
         const float r_start = 0.90f * width;
-        if (filled > r_start)
+        if (filled > r_start) {
             draw->AddRectFilled({pos.x + r_start, pos.y}, {pos.x + filled, pos.y + height}, IM_COL32(220, 60, 60, 255));
+        }
     }
 
     draw->AddRect(pos, {pos.x + width, pos.y + height}, IM_COL32(80, 80, 80, 255), 2.0f);
@@ -231,8 +346,7 @@ int main(int, char* argv[]) {
             if (rack->runner_alive) {
                 try_connect_socket(*rack);
             }
-            // Decay peak meters each frame, then pull new values from the runner.
-            rack->in_peak  *= 0.90f;
+            rack->in_peak *= 0.90f;
             rack->out_peak *= 0.90f;
             drain_ipc(*rack);
         }
@@ -266,65 +380,153 @@ int main(int, char* argv[]) {
         }
 
         for (int r = 0; r < static_cast<int>(racks.size()); ++r) {
-            if (!racks[r]->visible) {
+            Rack& rack = *racks[r];
+            if (!rack.visible) {
                 continue;
             }
 
-            ImGui::Begin(racks[r]->name.c_str(), &racks[r]->visible);
+            ImGui::Begin(rack.name.c_str(), &rack.visible);
 
-            ImGui::Text("Runner PID: %d", racks[r]->runner_pid);
+            ImGui::Text("Runner PID: %d", rack.runner_pid);
             ImGui::SameLine();
             ImGui::TextColored(
-                racks[r]->runner_alive ? ImVec4(0.3f, 0.8f, 0.3f, 1.0f) : ImVec4(0.9f, 0.3f, 0.3f, 1.0f),
-                racks[r]->runner_alive ? "Alive" : "Offline");
+                rack.runner_alive ? ImVec4(0.3f, 0.8f, 0.3f, 1.0f) : ImVec4(0.9f, 0.3f, 0.3f, 1.0f),
+                rack.runner_alive ? "Alive" : "Offline");
 
-            if (!racks[r]->runner_alive && ImGui::Button("Restart Runner")) {
-                racks[r]->runner_pid = spawn_runner(runner_binary, racks[r]->id);
-                racks[r]->runner_alive = racks[r]->runner_pid > 0;
+            if (!rack.runner_alive && ImGui::Button("Restart Runner")) {
+                rack.runner_pid = spawn_runner(runner_binary, rack.id);
+                rack.runner_alive = rack.runner_pid > 0;
             }
 
-            const bool connected = racks[r]->sock_fd >= 0;
+            const bool connected = rack.sock_fd >= 0;
             ImGui::TextColored(
                 connected ? ImVec4(0.3f, 0.8f, 0.3f, 1.0f) : ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
                 connected ? "IPC Connected" : "IPC Disconnected");
             ImGui::Separator();
 
-            if (ImGui::SliderFloat("Master Gain", &racks[r]->master_gain, 0.0f, 2.0f)) {
+            if (ImGui::SliderFloat("Master Gain", &rack.master_gain, 0.0f, 2.0f)) {
                 vessel::MsgSetGain msg;
-                msg.gain = racks[r]->master_gain;
-                send_ipc(*racks[r], msg);
+                msg.gain = rack.master_gain;
+                send_ipc(rack, msg);
             }
 
-            bool bypassed = racks[r]->bypassed_ui;
+            bool bypassed = rack.bypassed_ui;
             if (ImGui::Checkbox("Bypass", &bypassed)) {
-                racks[r]->bypassed_ui = bypassed;
+                rack.bypassed_ui = bypassed;
                 vessel::MsgSetBypass msg;
                 msg.bypassed = bypassed ? 1 : 0;
-                send_ipc(*racks[r], msg);
+                send_ipc(rack, msg);
             }
 
-            draw_level_meter("In",  racks[r]->in_peak);
-            draw_level_meter("Out", racks[r]->out_peak);
+            draw_level_meter("In", rack.in_peak);
+            draw_level_meter("Out", rack.out_peak);
             ImGui::Separator();
 
-            if (ImGui::BeginDragDropTarget()) {
-                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("PLUGIN_MOVE")) {
-                    int* data = static_cast<int*>(payload->Data);
-                    const int src_rack = data[0];
-                    const int src_idx = data[1];
+            if (ImGui::Button("+ Add Plugin")) {
+                rack.available_plugins.clear();
+                vessel::MsgReqPluginCatalog req;
+                send_ipc(rack, req);
+                rack.open_plugin_browser = true;
+            }
 
-                    RackPlugin moved_plugin = racks[src_rack]->plugins[src_idx];
-                    racks[src_rack]->plugins.erase(racks[src_rack]->plugins.begin() + src_idx);
-                    racks[r]->plugins.push_back(moved_plugin);
+            std::string popup_name = "Plugin Browser##" + std::to_string(rack.id);
+            if (rack.open_plugin_browser) {
+                ImGui::OpenPopup(popup_name.c_str());
+                rack.open_plugin_browser = false;
+            }
+
+            if (ImGui::BeginPopupModal(popup_name.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted("Available Plugins");
+                ImGui::Separator();
+
+                for (const auto& plugin_type : rack.available_plugins) {
+                    if (ImGui::Selectable(plugin_type.name.c_str())) {
+                        vessel::MsgAddPlugin msg;
+                        msg.plugin_type_id = plugin_type.plugin_type_id;
+                        send_ipc(rack, msg);
+                        ImGui::CloseCurrentPopup();
+                    }
                 }
-                ImGui::EndDragDropTarget();
+
+                if (rack.available_plugins.empty()) {
+                    ImGui::TextUnformatted("Waiting for rackhost plugin list...");
+                }
+
+                ImGui::Separator();
+                if (ImGui::Button("Close", ImVec2(120, 0))) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Plugins");
+
+            for (auto pit = rack.plugins.begin(); pit != rack.plugins.end();) {
+                RackPluginInstance& plugin = *pit;
+                ImGui::PushID(static_cast<int>(plugin.instance_id));
+
+                bool remove_requested = false;
+                const bool header_open = ImGui::CollapsingHeader(plugin.name.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+                if (ImGui::Button("Remove Plugin")) {
+                    vessel::MsgRemovePlugin msg;
+                    msg.instance_id = plugin.instance_id;
+                    send_ipc(rack, msg);
+                    remove_requested = true;
+                }
+
+                if (header_open) {
+                    for (auto& param : plugin.params) {
+                        ImGui::PushID(static_cast<int>(param.param_id));
+
+                        if (param.widget == vessel::ParamWidget::SLIDER) {
+                            float v = param.value;
+                            if (ImGui::SliderFloat(param.name.c_str(), &v, param.min_value, param.max_value)) {
+                                param.value = v;
+                                vessel::MsgSetPluginParam msg;
+                                msg.instance_id = plugin.instance_id;
+                                msg.param_id = param.param_id;
+                                msg.value = v;
+                                send_ipc(rack, msg);
+                            }
+                        } else if (param.widget == vessel::ParamWidget::TOGGLE) {
+                            bool b = param.value > 0.5f;
+                            if (ImGui::Checkbox(param.name.c_str(), &b)) {
+                                param.value = b ? 1.0f : 0.0f;
+                                vessel::MsgSetPluginParam msg;
+                                msg.instance_id = plugin.instance_id;
+                                msg.param_id = param.param_id;
+                                msg.value = param.value;
+                                send_ipc(rack, msg);
+                            }
+                        } else if (param.widget == vessel::ParamWidget::BUTTON) {
+                            if (ImGui::Button(param.name.c_str())) {
+                                vessel::MsgSetPluginParam msg;
+                                msg.instance_id = plugin.instance_id;
+                                msg.param_id = param.param_id;
+                                msg.value = 1.0f;
+                                send_ipc(rack, msg);
+                            }
+                        }
+
+                        ImGui::PopID();
+                    }
+                }
+
+                ImGui::PopID();
+
+                if (remove_requested) {
+                    pit = rack.plugins.erase(pit);
+                } else {
+                    ++pit;
+                }
             }
 
             if (ImGui::BeginPopupContextWindow()) {
                 if (ImGui::MenuItem("Rename Rack")) {
                     show_rename = true;
                     rack_to_rename = r;
-                    ::strncpy(rename_buf, racks[r]->name.c_str(), vessel::kMaxNameLen);
+                    std::strncpy(rename_buf, rack.name.c_str(), vessel::kMaxNameLen);
                     rename_buf[vessel::kMaxNameLen] = '\0';
                 }
                 if (ImGui::MenuItem("Delete Rack")) {
@@ -332,66 +534,6 @@ int main(int, char* argv[]) {
                     rack_to_delete = r;
                 }
                 ImGui::EndPopup();
-            }
-
-            for (int p = 0; p < static_cast<int>(racks[r]->plugins.size()); ++p) {
-                auto& plugin = racks[r]->plugins[p];
-                ImGui::PushID(p);
-
-                bool style_pushed = false;
-                if (plugin.bypassed) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-                    style_pushed = true;
-                }
-
-                if (ImGui::Button(plugin.bypassed ? "B" : "P", ImVec2(25, 0))) {
-                    plugin.bypassed = !plugin.bypassed;
-                }
-
-                if (style_pushed) {
-                    ImGui::PopStyleColor();
-                }
-
-                ImGui::SameLine();
-
-                const bool header_open = ImGui::CollapsingHeader(plugin.name.c_str(), ImGuiTreeNodeFlags_AllowOverlap);
-
-                if (ImGui::BeginDragDropSource()) {
-                    int payload_data[2] = {r, p};
-                    ImGui::SetDragDropPayload("PLUGIN_MOVE", payload_data, sizeof(int) * 2);
-                    ImGui::Text("Moving %s", plugin.name.c_str());
-                    ImGui::EndDragDropSource();
-                }
-
-                if (ImGui::BeginDragDropTarget()) {
-                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("PLUGIN_MOVE")) {
-                        int* data = static_cast<int*>(payload->Data);
-                        const int src_rack = data[0];
-                        const int src_idx = data[1];
-
-                        RackPlugin moved_plugin = racks[src_rack]->plugins[src_idx];
-                        racks[src_rack]->plugins.erase(racks[src_rack]->plugins.begin() + src_idx);
-
-                        const int insert_at = p;
-                        racks[r]->plugins.insert(racks[r]->plugins.begin() + insert_at, moved_plugin);
-                    }
-                    ImGui::EndDragDropTarget();
-                }
-
-                if (header_open) {
-                    ImGui::Indent();
-                    ImGui::SliderFloat("Volume", &plugin.volume, 0.0f, 1.0f);
-                    if (ImGui::Button("Remove Plugin")) {
-                        racks[r]->plugins.erase(racks[r]->plugins.begin() + p);
-                    }
-                    ImGui::Unindent();
-                }
-
-                ImGui::PopID();
-            }
-
-            if (ImGui::Button("+ Add Plugin")) {
-                racks[r]->plugins.push_back({"New Plugin", true, 1.0f, false});
             }
 
             ImGui::End();
@@ -406,15 +548,12 @@ int main(int, char* argv[]) {
             if (show_rename) ImGui::SetKeyboardFocusHere();
             show_rename = false;
             ImGui::SetNextItemWidth(300.0f);
-            const bool entered = ImGui::InputText("##rename", rename_buf, sizeof(rename_buf),
-                                                  ImGuiInputTextFlags_EnterReturnsTrue);
+            const bool entered = ImGui::InputText("##rename", rename_buf, sizeof(rename_buf), ImGuiInputTextFlags_EnterReturnsTrue);
             ImGui::Separator();
             const bool ok_clicked = ImGui::Button("OK", ImVec2(120, 0));
             if (entered || ok_clicked) {
                 rename_buf[vessel::kMaxNameLen] = '\0';
-                if (rename_buf[0] != '\0'
-                    && rack_to_rename >= 0
-                    && rack_to_rename < static_cast<int>(racks.size())) {
+                if (rename_buf[0] != '\0' && rack_to_rename >= 0 && rack_to_rename < static_cast<int>(racks.size())) {
                     racks[rack_to_rename]->name = rename_buf;
                 }
                 rack_to_rename = -1;

@@ -11,11 +11,27 @@ inline std::string socket_path_by_id(uint32_t id) {
 }
 
 static constexpr uint32_t kMaxNameLen = 63;  // excluding null terminator; used by GUI for rack display names
+static constexpr uint32_t kMaxPluginNameLen = 63;
+static constexpr uint32_t kMaxParamNameLen = 47;
 
 enum class MsgType : uint8_t {
-    SET_GAIN    = 0x01,
-    SET_BYPASS  = 0x02,
-    PEAK_LEVELS = 0x03,  // runner -> GUI
+    SET_GAIN             = 0x01,
+    SET_BYPASS           = 0x02,
+    PEAK_LEVELS          = 0x03,  // runner -> GUI
+    REQ_PLUGIN_CATALOG   = 0x10,  // GUI -> runner
+    PLUGIN_CATALOG_ENTRY = 0x11,  // runner -> GUI
+    ADD_PLUGIN           = 0x12,  // GUI -> runner
+    PLUGIN_INSTANCE_ADDED = 0x13, // runner -> GUI
+    REQ_PLUGIN_PARAMS    = 0x14,  // GUI -> runner
+    PLUGIN_PARAM_DESC    = 0x15,  // runner -> GUI
+    SET_PLUGIN_PARAM     = 0x16,  // GUI -> runner
+    REMOVE_PLUGIN        = 0x17,  // GUI -> runner
+};
+
+enum class ParamWidget : uint8_t {
+    SLIDER = 0,
+    BUTTON = 1,
+    TOGGLE = 2,
 };
 
 // Every message begins with this 2-byte header.
@@ -39,6 +55,58 @@ struct __attribute__((packed)) MsgPeakLevels {
     MsgHeader hdr{MsgType::PEAK_LEVELS, sizeof(MsgPeakLevels)};
     float in_peak{0.0f};
     float out_peak{0.0f};
+};
+
+struct __attribute__((packed)) MsgReqPluginCatalog {
+    MsgHeader hdr{MsgType::REQ_PLUGIN_CATALOG, sizeof(MsgReqPluginCatalog)};
+};
+
+struct __attribute__((packed)) MsgPluginCatalogEntry {
+    MsgHeader hdr{MsgType::PLUGIN_CATALOG_ENTRY, sizeof(MsgPluginCatalogEntry)};
+    uint32_t plugin_type_id{0};
+    char name[kMaxPluginNameLen + 1]{};
+    uint8_t is_last{0};
+};
+
+struct __attribute__((packed)) MsgAddPlugin {
+    MsgHeader hdr{MsgType::ADD_PLUGIN, sizeof(MsgAddPlugin)};
+    uint32_t plugin_type_id{0};
+};
+
+struct __attribute__((packed)) MsgPluginInstanceAdded {
+    MsgHeader hdr{MsgType::PLUGIN_INSTANCE_ADDED, sizeof(MsgPluginInstanceAdded)};
+    uint32_t instance_id{0};
+    uint32_t plugin_type_id{0};
+    char name[kMaxPluginNameLen + 1]{};
+};
+
+struct __attribute__((packed)) MsgReqPluginParams {
+    MsgHeader hdr{MsgType::REQ_PLUGIN_PARAMS, sizeof(MsgReqPluginParams)};
+    uint32_t instance_id{0};
+};
+
+struct __attribute__((packed)) MsgPluginParamDesc {
+    MsgHeader hdr{MsgType::PLUGIN_PARAM_DESC, sizeof(MsgPluginParamDesc)};
+    uint32_t instance_id{0};
+    uint32_t param_id{0};
+    ParamWidget widget{ParamWidget::SLIDER};
+    float min_value{0.0f};
+    float max_value{1.0f};
+    float value{0.0f};
+    char name[kMaxParamNameLen + 1]{};
+    uint8_t is_last{0};
+};
+
+struct __attribute__((packed)) MsgSetPluginParam {
+    MsgHeader hdr{MsgType::SET_PLUGIN_PARAM, sizeof(MsgSetPluginParam)};
+    uint32_t instance_id{0};
+    uint32_t param_id{0};
+    float value{0.0f};
+};
+
+struct __attribute__((packed)) MsgRemovePlugin {
+    MsgHeader hdr{MsgType::REMOVE_PLUGIN, sizeof(MsgRemovePlugin)};
+    uint32_t instance_id{0};
 };
 
 }  // namespace vessel
