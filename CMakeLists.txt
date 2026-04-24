@@ -32,40 +32,54 @@ set(IMGUI_SRC ${imgui_SOURCE_DIR}/imgui.cpp
               ${imgui_SOURCE_DIR}/imgui_widgets.cpp
               ${imgui_SOURCE_DIR}/imgui_tables.cpp)
 
-# Gather your source files
-file(GLOB_RECURSE SOURCES "src/*.cpp" "src/*.c")
+# --- Executables ---
 
-# Define the executable
-add_executable(${PROJECT_NAME} 
-    ${SOURCES} 
+add_executable(vessel-ui
+    src/gui/main.cpp
     ${GLAD_SRC}
     ${IMGUI_SRC}
-    # ImGui implementation files for GLFW/OpenGL3
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
+add_executable(vessel-runner
+    src/rackhost/main.cpp
+)
+
+# Keep a convenient legacy target name.
+add_executable(${PROJECT_NAME} ALIAS vessel-ui)
+
 # --- Include Directories ---
 
-target_include_directories(${PROJECT_NAME} PRIVATE 
+target_include_directories(vessel-ui PRIVATE
     "include"
     "${GLAD_INCLUDE}"
     "${imgui_SOURCE_DIR}"
     "${imgui_SOURCE_DIR}/backends"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/common"
+)
+
+target_include_directories(vessel-runner PRIVATE
+    "include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/common"
 )
 
 # --- Linking ---
 
-# Link libraries (PipeWire, GLFW, and DL for GLAD)
-target_link_libraries(${PROJECT_NAME} PRIVATE 
+target_link_libraries(vessel-ui PRIVATE
     glfw
+)
+
+target_link_libraries(vessel-runner PRIVATE
     PkgConfig::PIPEWIRE
     PkgConfig::SPA
 )
 
 # --- Compiler Optimizations ---
 if(MSVC)
-    target_compile_options(${PROJECT_NAME} PRIVATE /W4)
+    target_compile_options(vessel-ui PRIVATE /W4)
+    target_compile_options(vessel-runner PRIVATE /W4)
 else()
-    target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(vessel-ui PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(vessel-runner PRIVATE -Wall -Wextra -Wpedantic)
 endif()

@@ -65,3 +65,18 @@ By utilizing this multi-process structure, Vessel achieves a level of stability 
 * [ ] Create headless `vessel-runner` template.
 * [ ] Integrate `shmget`/`shmat` for cross-process metering.
 * [ ] Add dynamic `pw-link` orchestration within the GUI manager.
+
+---
+
+## 6. Current Source Layout (Transition Snapshot)
+
+The repository now follows the initial split architecture:
+
+* `src/gui/main.cpp` builds `vessel-ui` (orchestrator process with ImGui + GLFW).
+* `src/rackhost/main.cpp` builds `vessel-runner` (headless PipeWire rack host).
+
+Current behavior during this transition:
+
+* `vessel-ui` spawns one `vessel-runner` process per rack and monitors lifecycle (PID/alive state).
+* Rack input/output linking is still done through `pw-link` commands from the UI.
+* IPC control socket and SHM telemetry are intentionally stubbed as TODO while the executable split stabilizes.
