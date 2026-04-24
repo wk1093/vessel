@@ -109,26 +109,25 @@ const struct pw_filter_events kFilterEvents = [] {
     return events;
 }();
 
-std::string parse_rack_name(int argc, char** argv) {
-    std::string rack_name = "Main Rack";
+uint32_t parse_rack_id(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--name") {
-            rack_name = argv[i + 1];
-            break;
+        if (std::string(argv[i]) == "--id") {
+            return static_cast<uint32_t>(std::stoul(argv[i + 1]));
         }
     }
-    return rack_name;
+    return 0;
 }
 
-bool setup_audio(RunnerRack& rack, pw_loop* loop) {
+bool setup_audio(RunnerRack& rack, pw_loop* loop, uint32_t rack_id) {
+    const std::string node_name = "vessel-rack-" + std::to_string(rack_id);
     rack.filter = pw_filter_new_simple(
         loop,
-        rack.name.c_str(),
+        node_name.c_str(),
         pw_properties_new(
             PW_KEY_MEDIA_TYPE, "Audio",
             PW_KEY_MEDIA_CATEGORY, "Filter",
             PW_KEY_MEDIA_CLASS, "Audio/Filter",
-            PW_KEY_NODE_NAME, rack.name.c_str(),
+            PW_KEY_NODE_NAME, node_name.c_str(),
             nullptr),
         &kFilterEvents,
         &rack);
@@ -178,7 +177,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    std::string rack_name = parse_rack_name(argc, argv);
+    const uint32_t rack_id = parse_rack_id(argc, argv);
 
     pw_init(&argc, &argv);
 
@@ -197,14 +196,13 @@ int main(int argc, char* argv[]) {
     }
 
     RunnerRack rack;
-    rack.name = rack_name;
 
     pw_thread_loop_lock(thread_loop);
-    bool ok = setup_audio(rack, pw_thread_loop_get_loop(thread_loop));
+    bool ok = setup_audio(rack, pw_thread_loop_get_loop(thread_loop), rack_id);
     pw_thread_loop_unlock(thread_loop);
 
     if (!ok) {
-        std::cerr << "failed to initialize runner for rack: " << rack_name << std::endl;
+        std::cerr << "failed to initialize runner for rack id: " << rack_id << std::endl;
         pw_thread_loop_stop(thread_loop);
         pw_thread_loop_destroy(thread_loop);
         pw_deinit();
@@ -214,7 +212,7 @@ int main(int argc, char* argv[]) {
     // --- Unix Domain Socket Server ---
     int server_fd = -1;
     int client_fd = -1;
-    const std::string sock_path = vessel::socket_path(rack_name);
+    const std::string sock_path = vessel::socket_path_by_id(rack_id);
     ::unlink(sock_path.c_str());  // remove stale socket from a previous crash
 
     server_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);

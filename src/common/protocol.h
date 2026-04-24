@@ -1,21 +1,16 @@
 #pragma once
 
-#include <cctype>
 #include <cstdint>
 #include <string>
 
 namespace vessel {
 
-// Returns the Unix domain socket path for a named rack.
-// The rack name is sanitized so the path is filesystem-safe.
-inline std::string socket_path(const std::string& rack_name) {
-    std::string sanitized;
-    sanitized.reserve(rack_name.size());
-    for (char c : rack_name) {
-        sanitized += (std::isalnum(static_cast<unsigned char>(c)) || c == '_') ? c : '_';
-    }
-    return "/tmp/vessel-" + sanitized + ".sock";
+// Returns the Unix domain socket path for a rack identified by a stable integer ID.
+inline std::string socket_path_by_id(uint32_t id) {
+    return "/tmp/vessel-rack-" + std::to_string(id) + ".sock";
 }
+
+static constexpr uint32_t kMaxNameLen = 63;  // excluding null terminator; used by GUI for rack display names
 
 enum class MsgType : uint8_t {
     SET_GAIN    = 0x01,

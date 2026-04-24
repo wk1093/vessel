@@ -31,6 +31,7 @@ struct RackPlugin {
 
 struct Rack {
     std::string name;
+    uint32_t id = 0;
     bool visible = true;
     bool runner_alive = false;
     pid_t runner_pid = -1;
@@ -52,10 +53,13 @@ struct Rack {
     }
 };
 
-pid_t spawn_runner(const std::string& runner_binary, const std::string& rack_name) {
+pid_t spawn_runner(const std::string& runner_binary, uint32_t id) {
     pid_t pid = fork();
     if (pid == 0) {
-        execl(runner_binary.c_str(), runner_binary.c_str(), "--name", rack_name.c_str(), nullptr);
+        const std::string id_str = std::to_string(id);
+        execl(runner_binary.c_str(), runner_binary.c_str(),
+              "--id", id_str.c_str(),
+              nullptr);
         _exit(127);
     }
     return pid;
@@ -104,7 +108,7 @@ void try_connect_socket(Rack& rack) {
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    const std::string path = vessel::socket_path(rack.name);
+    const std::string path = vessel::socket_path_by_id(rack.id);
     ::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
@@ -200,10 +204,12 @@ int main(int, char* argv[]) {
     ImGui_ImplOpenGL3_Init("#version 130");
 
     std::vector<std::unique_ptr<Rack>> racks;
+    uint32_t next_rack_id = 1;
     auto add_rack = [&](const std::string& name) {
         auto rack = std::make_unique<Rack>();
+        rack->id = next_rack_id++;
         rack->name = name;
-        rack->runner_pid = spawn_runner(runner_binary, rack->name);
+        rack->runner_pid = spawn_runner(runner_binary, rack->id);
         rack->runner_alive = rack->runner_pid > 0;
         racks.emplace_back(std::move(rack));
     };
@@ -212,6 +218,10 @@ int main(int, char* argv[]) {
 
     bool show_confirm_delete = false;
     int rack_to_delete = -1;
+
+    bool show_rename = false;
+    int rack_to_rename = -1;
+    char rename_buf[vessel::kMaxNameLen + 1]{};
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -269,7 +279,7 @@ int main(int, char* argv[]) {
                 racks[r]->runner_alive ? "Alive" : "Offline");
 
             if (!racks[r]->runner_alive && ImGui::Button("Restart Runner")) {
-                racks[r]->runner_pid = spawn_runner(runner_binary, racks[r]->name);
+                racks[r]->runner_pid = spawn_runner(runner_binary, racks[r]->id);
                 racks[r]->runner_alive = racks[r]->runner_pid > 0;
             }
 
@@ -311,6 +321,12 @@ int main(int, char* argv[]) {
             }
 
             if (ImGui::BeginPopupContextWindow()) {
+                if (ImGui::MenuItem("Rename Rack")) {
+                    show_rename = true;
+                    rack_to_rename = r;
+                    ::strncpy(rename_buf, racks[r]->name.c_str(), vessel::kMaxNameLen);
+                    rename_buf[vessel::kMaxNameLen] = '\0';
+                }
                 if (ImGui::MenuItem("Delete Rack")) {
                     show_confirm_delete = true;
                     rack_to_delete = r;
@@ -379,6 +395,38 @@ int main(int, char* argv[]) {
             }
 
             ImGui::End();
+        }
+
+        if (show_rename) {
+            ImGui::OpenPopup("Rename Rack");
+        }
+
+        if (ImGui::BeginPopupModal("Rename Rack", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("New name:");
+            if (show_rename) ImGui::SetKeyboardFocusHere();
+            show_rename = false;
+            ImGui::SetNextItemWidth(300.0f);
+            const bool entered = ImGui::InputText("##rename", rename_buf, sizeof(rename_buf),
+                                                  ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::Separator();
+            const bool ok_clicked = ImGui::Button("OK", ImVec2(120, 0));
+            if (entered || ok_clicked) {
+                rename_buf[vessel::kMaxNameLen] = '\0';
+                if (rename_buf[0] != '\0'
+                    && rack_to_rename >= 0
+                    && rack_to_rename < static_cast<int>(racks.size())) {
+                    racks[rack_to_rename]->name = rename_buf;
+                }
+                rack_to_rename = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SetItemDefaultFocus();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                rack_to_rename = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
 
         if (show_confirm_delete) {
