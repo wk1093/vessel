@@ -16,6 +16,24 @@
 #include <pipewire/pipewire.h>
 #include <pipewire/filter.h>
 
+std::vector<std::string> get_pw_ports(bool input) {
+    std::vector<std::string> ports;
+    // -i lists inputs (sources), -o lists outputs (sinks)
+    FILE* pipe = popen(input ? "pw-link -i" : "pw-link -o", "r");
+    if (!pipe) return ports;
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        std::string port = buffer;
+        port.erase(port.find_last_not_of(" \n\r\t") + 1); // trim
+        // Filter out Vessel's own ports to avoid feedback loops
+        if (port.find("Vessel") == std::string::npos) {
+            ports.push_back(port);
+        }
+    }
+    pclose(pipe);
+    return ports;
+}
+
 // Shared state between UI and Audio thread
 struct AudioState {
     std::atomic<float> volume{1.0f};
@@ -88,33 +106,25 @@ struct Rack {
 
     // Initialize the PipeWire filter for this rack
     void setup_audio(struct pw_loop *loop) {
-        // 1. Create filter
         filter = pw_filter_new_simple(loop, name.c_str(), 
-            pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", 
-                            PW_KEY_MEDIA_CATEGORY, "Filter", 
-                            PW_KEY_NODE_AUTOCONNECT, "true", // Helps ports show up
-                            NULL),
+            pw_properties_new(
+                PW_KEY_MEDIA_TYPE, "Audio", 
+                PW_KEY_MEDIA_CATEGORY, "Filter",
+                "node.name", name.c_str(), // Explicit node name for pw-link
+                NULL),
             &filter_events, this);
 
-        // 2. Add Ports (using MAP_BUFFERS)
         input_port = pw_filter_add_port(filter, PW_DIRECTION_INPUT, 
-            PW_FILTER_PORT_FLAG_MAP_BUFFERS,
-            sizeof(float), 
-            pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", 
-                            PW_KEY_PORT_NAME, "input", NULL), 
+            PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float), 
+            pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", PW_KEY_PORT_NAME, "input", NULL), 
             NULL, 0);
 
         output_port = pw_filter_add_port(filter, PW_DIRECTION_OUTPUT, 
-            PW_FILTER_PORT_FLAG_MAP_BUFFERS,
-            sizeof(float), 
-            pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", 
-                            PW_KEY_PORT_NAME, "output", NULL), 
+            PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float), 
+            pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", PW_KEY_PORT_NAME, "output", NULL), 
             NULL, 0);
 
-        // 3. Connect
-        if (pw_filter_connect(filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0) {
-            std::cerr << "Failed to connect filter" << std::endl;
-        }
+        pw_filter_connect(filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0);
     }
 };
 
@@ -155,24 +165,6 @@ static void on_process(void *data, struct spa_io_position *pos) {
 
     pw_filter_queue_buffer(rack->input_port, b_in);
     pw_filter_queue_buffer(rack->output_port, b_out);
-}
-
-std::vector<std::string> get_pw_ports(bool input) {
-    std::vector<std::string> ports;
-    // -i lists inputs (sources), -o lists outputs (sinks)
-    FILE* pipe = popen(input ? "pw-link -i" : "pw-link -o", "r");
-    if (!pipe) return ports;
-    char buffer[256];
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        std::string port = buffer;
-        port.erase(port.find_last_not_of(" \n\r\t") + 1); // trim
-        // Filter out Vessel's own ports to avoid feedback loops
-        if (port.find("Vessel") == std::string::npos) {
-            ports.push_back(port);
-        }
-    }
-    pclose(pipe);
-    return ports;
 }
 
 int main(int argc, char* argv[]) {
@@ -263,9 +255,9 @@ int main(int argc, char* argv[]) {
 
                 // Input Selection
                 if (ImGui::BeginCombo("Input Source", racks[r]->input_device_name.c_str())) {
-                    // In a real version, you'd iterate over found PipeWire nodes here
-                    if (ImGui::Selectable("System Microphone")) { 
-                        racks[r]->input_device_name = "System Microphone"; 
+                    auto inputs = get_pw_ports(true); // Get real system inputs
+                    for (auto& in : inputs) {
+                        if (ImGui::Selectable(in.c_str())) { racks[r]->input_device_name = in; }
                     }
                     ImGui::EndCombo();
                 }
@@ -273,13 +265,15 @@ int main(int argc, char* argv[]) {
                 if (ImGui::Button("Intercept In")) {
                     // TODO: Logic to link all outputs of selected node to this rack's input
                     std::cout << "Intercepting Input for " << racks[r]->name << std::endl;
-                    racks[r]->connect_to_node(racks[r]->input_device_name, true);
+                    std::string cmd = "pw-link \"" + racks[r]->input_device_name + "\" \"" + racks[r]->name + ":input\"";
+                    system(cmd.c_str());
                 }
 
                 // Output Selection
                 if (ImGui::BeginCombo("Output Sink", racks[r]->output_device_name.c_str())) {
-                    if (ImGui::Selectable("Built-in Audio Analog Stereo")) { 
-                        racks[r]->output_device_name = "Built-in Audio Analog Stereo"; 
+                    auto outputs = get_pw_ports(false); // Get real system outputs
+                    for (auto& out : outputs) {
+                        if (ImGui::Selectable(out.c_str())) { racks[r]->output_device_name = out; }
                     }
                     ImGui::EndCombo();
                 }
@@ -287,7 +281,8 @@ int main(int argc, char* argv[]) {
                 if (ImGui::Button("Intercept Out")) {
                     // TODO: Logic to link this rack's output to the selected node's input
                     std::cout << "Intercepting Output for " << racks[r]->name << std::endl;
-                    racks[r]->connect_to_node(racks[r]->output_device_name, false);
+                    std::string cmd = "pw-link \"" + racks[r]->name + ":output\" \"" + racks[r]->output_device_name + "\"";
+                    system(cmd.c_str());
                 }
 
                 ImGui::Unindent();
