@@ -39,6 +39,9 @@ struct Rack {
     float master_gain = 1.0f;
     bool bypassed_ui = false;
 
+    float in_peak  = 0.0f;
+    float out_peak = 0.0f;
+
     std::vector<RackPlugin> plugins;
 
     ~Rack() {
@@ -122,6 +125,50 @@ void send_ipc(Rack& rack, const T& msg) {
     }
 }
 
+void drain_ipc(Rack& rack) {
+    if (rack.sock_fd < 0) return;
+    vessel::MsgPeakLevels msg{};
+    ssize_t n;
+    while ((n = ::recv(rack.sock_fd, &msg, sizeof(msg), MSG_DONTWAIT)) == sizeof(msg)) {
+        rack.in_peak  = std::max(rack.in_peak,  msg.in_peak);
+        rack.out_peak = std::max(rack.out_peak, msg.out_peak);
+    }
+    if (n == 0) {
+        ::close(rack.sock_fd);
+        rack.sock_fd = -1;
+    }
+}
+
+static void draw_level_meter(const char* label, float level) {
+    const float width   = ImGui::GetContentRegionAvail().x - 36.0f;
+    const float height  = 10.0f;
+    const ImVec2 pos    = ImGui::GetCursorScreenPos();
+    ImDrawList*  draw   = ImGui::GetWindowDrawList();
+
+    draw->AddRectFilled(pos, {pos.x + width, pos.y + height}, IM_COL32(35, 35, 35, 255), 2.0f);
+
+    const float filled = std::min(level, 1.0f) * width;
+    if (filled > 0.0f) {
+        const float g_end = std::min(filled, 0.70f * width);
+        if (g_end > 0)
+            draw->AddRectFilled(pos, {pos.x + g_end, pos.y + height}, IM_COL32(50, 200, 50, 255), 2.0f);
+
+        const float y_start = 0.70f * width;
+        const float y_end   = std::min(filled, 0.90f * width);
+        if (y_end > y_start)
+            draw->AddRectFilled({pos.x + y_start, pos.y}, {pos.x + y_end, pos.y + height}, IM_COL32(220, 200, 30, 255));
+
+        const float r_start = 0.90f * width;
+        if (filled > r_start)
+            draw->AddRectFilled({pos.x + r_start, pos.y}, {pos.x + filled, pos.y + height}, IM_COL32(220, 60, 60, 255));
+    }
+
+    draw->AddRect(pos, {pos.x + width, pos.y + height}, IM_COL32(80, 80, 80, 255), 2.0f);
+    ImGui::Dummy({width, height});
+    ImGui::SameLine(0, 6);
+    ImGui::TextUnformatted(label);
+}
+
 int main(int, char* argv[]) {
     const std::string runner_binary = get_runner_binary_path(argv[0]);
 
@@ -174,6 +221,10 @@ int main(int, char* argv[]) {
             if (rack->runner_alive) {
                 try_connect_socket(*rack);
             }
+            // Decay peak meters each frame, then pull new values from the runner.
+            rack->in_peak  *= 0.90f;
+            rack->out_peak *= 0.90f;
+            drain_ipc(*rack);
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -241,6 +292,9 @@ int main(int, char* argv[]) {
                 msg.bypassed = bypassed ? 1 : 0;
                 send_ipc(*racks[r], msg);
             }
+
+            draw_level_meter("In",  racks[r]->in_peak);
+            draw_level_meter("Out", racks[r]->out_peak);
             ImGui::Separator();
 
             if (ImGui::BeginDragDropTarget()) {

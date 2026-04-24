@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
@@ -30,8 +31,8 @@ struct AudioState {
 struct RunnerRack {
     std::string name;
     struct pw_filter* filter = nullptr;
-    void* input_port = nullptr;
-    void* output_port = nullptr;
+    void* input_ports[2] = {nullptr, nullptr};   // FL, FR
+    void* output_ports[2] = {nullptr, nullptr};  // FL, FR
     AudioState audio_state;
 
     ~RunnerRack() {
@@ -49,46 +50,56 @@ void signal_handler(int) {
 static void on_process(void* data, struct spa_io_position*) {
     RunnerRack* rack = static_cast<RunnerRack*>(data);
 
-    auto* b_in = static_cast<struct pw_buffer*>(pw_filter_dequeue_buffer(rack->input_port));
-    auto* b_out = static_cast<struct pw_buffer*>(pw_filter_dequeue_buffer(rack->output_port));
-
-    if (!b_in || !b_out) {
-        if (b_in) {
-            pw_filter_queue_buffer(rack->input_port, b_in);
-        }
-        if (b_out) {
-            pw_filter_queue_buffer(rack->output_port, b_out);
-        }
-        return;
-    }
-
-    float* in = static_cast<float*>(b_in->buffer->datas[0].data);
-    float* out = static_cast<float*>(b_out->buffer->datas[0].data);
-
-    const uint32_t n_samples = b_in->buffer->datas[0].chunk->size / sizeof(float);
-
-    float p_in = 0.0f;
-    float p_out = 0.0f;
     const float vol = rack->audio_state.volume.load(std::memory_order_relaxed);
     const bool bypassed = rack->audio_state.bypassed.load(std::memory_order_relaxed);
+    float p_in = 0.0f;
+    float p_out = 0.0f;
 
-    for (uint32_t i = 0; i < n_samples; ++i) {
-        float s = in[i];
-        p_in = std::max(p_in, std::fabs(s));
+    for (int ch = 0; ch < 2; ++ch) {
+        auto* b_in  = static_cast<struct pw_buffer*>(pw_filter_dequeue_buffer(rack->input_ports[ch]));
+        auto* b_out = static_cast<struct pw_buffer*>(pw_filter_dequeue_buffer(rack->output_ports[ch]));
 
-        if (!bypassed) {
-            s *= vol;
+        if (!b_out) {
+            if (b_in) pw_filter_queue_buffer(rack->input_ports[ch], b_in);
+            continue;
         }
 
-        out[i] = s;
-        p_out = std::max(p_out, std::fabs(s));
+        auto& d_out = b_out->buffer->datas[0];
+
+        if (!b_in) {
+            // No input connected — output silence so we don't corrupt downstream nodes.
+            if (d_out.data) std::memset(d_out.data, 0, d_out.maxsize);
+            d_out.chunk->offset = 0;
+            d_out.chunk->stride = sizeof(float);
+            d_out.chunk->size   = d_out.maxsize;
+            pw_filter_queue_buffer(rack->output_ports[ch], b_out);
+            continue;
+        }
+
+        auto& d_in = b_in->buffer->datas[0];
+        const float*   in  = static_cast<float*>(d_in.data);
+        float*         out = static_cast<float*>(d_out.data);
+        const uint32_t n_samples = d_in.chunk->size / sizeof(float);
+
+        for (uint32_t i = 0; i < n_samples; ++i) {
+            float s = in[i];
+            p_in = std::max(p_in, std::fabs(s));
+            if (!bypassed) s *= vol;
+            out[i] = s;
+            p_out = std::max(p_out, std::fabs(s));
+        }
+
+        // Tell PipeWire exactly how many valid bytes are in the output buffer.
+        d_out.chunk->offset = 0;
+        d_out.chunk->stride = sizeof(float);
+        d_out.chunk->size   = n_samples * sizeof(float);
+
+        pw_filter_queue_buffer(rack->input_ports[ch], b_in);
+        pw_filter_queue_buffer(rack->output_ports[ch], b_out);
     }
 
     rack->audio_state.in_peak.store(p_in, std::memory_order_relaxed);
     rack->audio_state.out_peak.store(p_out, std::memory_order_relaxed);
-
-    pw_filter_queue_buffer(rack->input_port, b_in);
-    pw_filter_queue_buffer(rack->output_port, b_out);
 }
 
 const struct pw_filter_events kFilterEvents = [] {
@@ -116,7 +127,8 @@ bool setup_audio(RunnerRack& rack, pw_loop* loop) {
         pw_properties_new(
             PW_KEY_MEDIA_TYPE, "Audio",
             PW_KEY_MEDIA_CATEGORY, "Filter",
-            "node.name", rack.name.c_str(),
+            PW_KEY_MEDIA_CLASS, "Audio/Filter",
+            PW_KEY_NODE_NAME, rack.name.c_str(),
             nullptr),
         &kFilterEvents,
         &rack);
@@ -125,25 +137,36 @@ bool setup_audio(RunnerRack& rack, pw_loop* loop) {
         return false;
     }
 
-    rack.input_port = pw_filter_add_port(
-        rack.filter,
-        PW_DIRECTION_INPUT,
-        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
-        sizeof(float),
-        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", PW_KEY_PORT_NAME, "input", nullptr),
-        nullptr,
-        0);
+    rack.input_ports[0] = pw_filter_add_port(
+        rack.filter, PW_DIRECTION_INPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float),
+        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono",
+                          PW_KEY_PORT_NAME, "input_FL",
+                          "audio.channel", "FL", nullptr),
+        nullptr, 0);
 
-    rack.output_port = pw_filter_add_port(
-        rack.filter,
-        PW_DIRECTION_OUTPUT,
-        PW_FILTER_PORT_FLAG_MAP_BUFFERS,
-        sizeof(float),
-        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono", PW_KEY_PORT_NAME, "output", nullptr),
-        nullptr,
-        0);
+    rack.input_ports[1] = pw_filter_add_port(
+        rack.filter, PW_DIRECTION_INPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float),
+        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono",
+                          PW_KEY_PORT_NAME, "input_FR",
+                          "audio.channel", "FR", nullptr),
+        nullptr, 0);
 
-    if (!rack.input_port || !rack.output_port) {
+    rack.output_ports[0] = pw_filter_add_port(
+        rack.filter, PW_DIRECTION_OUTPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float),
+        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono",
+                          PW_KEY_PORT_NAME, "output_FL",
+                          "audio.channel", "FL", nullptr),
+        nullptr, 0);
+
+    rack.output_ports[1] = pw_filter_add_port(
+        rack.filter, PW_DIRECTION_OUTPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, sizeof(float),
+        pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono",
+                          PW_KEY_PORT_NAME, "output_FR",
+                          "audio.channel", "FR", nullptr),
+        nullptr, 0);
+
+    if (!rack.input_ports[0] || !rack.input_ports[1]
+        || !rack.output_ports[0] || !rack.output_ports[1]) {
         return false;
     }
 
@@ -209,6 +232,8 @@ int main(int argc, char* argv[]) {
     }
 
     // --- Main idle loop (select-based, 10 ms max latency per iteration) ---
+    auto last_peak_send = std::chrono::steady_clock::now();
+
     while (g_running.load(std::memory_order_relaxed)) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -217,51 +242,63 @@ int main(int argc, char* argv[]) {
         if (client_fd >= 0) { FD_SET(client_fd, &rfds); maxfd = std::max(maxfd, client_fd); }
 
         struct timeval tv{0, 10000};  // 10 ms
-        if (::select(maxfd + 1, &rfds, nullptr, nullptr, &tv) <= 0) {
-            continue;
-        }
+        const int sel = ::select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
+        if (sel < 0) continue;
 
-        // Accept a new GUI connection (replaces any previously connected client).
-        if (server_fd >= 0 && FD_ISSET(server_fd, &rfds)) {
-            const int new_fd = ::accept(server_fd, nullptr, nullptr);
-            if (new_fd >= 0) {
-                if (client_fd >= 0) ::close(client_fd);
-                client_fd = new_fd;
-                ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
+        if (sel > 0) {
+            // Accept a new GUI connection (replaces any previously connected client).
+            if (server_fd >= 0 && FD_ISSET(server_fd, &rfds)) {
+                const int new_fd = ::accept(server_fd, nullptr, nullptr);
+                if (new_fd >= 0) {
+                    if (client_fd >= 0) ::close(client_fd);
+                    client_fd = new_fd;
+                    ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
+                }
+            }
+
+            // Drain incoming control messages.
+            if (client_fd >= 0 && FD_ISSET(client_fd, &rfds)) {
+                while (true) {
+                    vessel::MsgHeader hdr{};
+                    const ssize_t n = ::recv(client_fd, &hdr, sizeof(hdr), MSG_DONTWAIT);
+                    if (n == 0) {
+                        // GUI disconnected cleanly.
+                        ::close(client_fd);
+                        client_fd = -1;
+                        break;
+                    }
+                    if (n < static_cast<ssize_t>(sizeof(hdr))) {
+                        break;  // EAGAIN or incomplete header — try again next iteration.
+                    }
+
+                    const uint8_t payload_size = hdr.size - static_cast<uint8_t>(sizeof(hdr));
+
+                    if (hdr.type == vessel::MsgType::SET_GAIN
+                        && payload_size == sizeof(vessel::MsgSetGain::gain)) {
+                        float gain = 1.0f;
+                        if (::recv(client_fd, &gain, sizeof(gain), MSG_DONTWAIT) == sizeof(gain)) {
+                            rack.audio_state.volume.store(gain, std::memory_order_relaxed);
+                        }
+                    } else if (hdr.type == vessel::MsgType::SET_BYPASS
+                               && payload_size == sizeof(vessel::MsgSetBypass::bypassed)) {
+                        uint8_t val = 0;
+                        if (::recv(client_fd, &val, sizeof(val), MSG_DONTWAIT) == sizeof(val)) {
+                            rack.audio_state.bypassed.store(val != 0, std::memory_order_relaxed);
+                        }
+                    }
+                }
             }
         }
 
-        // Drain incoming control messages.
-        if (client_fd >= 0 && FD_ISSET(client_fd, &rfds)) {
-            while (true) {
-                vessel::MsgHeader hdr{};
-                const ssize_t n = ::recv(client_fd, &hdr, sizeof(hdr), MSG_DONTWAIT);
-                if (n == 0) {
-                    // GUI disconnected cleanly.
-                    ::close(client_fd);
-                    client_fd = -1;
-                    break;
-                }
-                if (n < static_cast<ssize_t>(sizeof(hdr))) {
-                    break;  // EAGAIN or incomplete header — try again next iteration.
-                }
-
-                const uint8_t payload_size = hdr.size - static_cast<uint8_t>(sizeof(hdr));
-
-                if (hdr.type == vessel::MsgType::SET_GAIN
-                    && payload_size == sizeof(vessel::MsgSetGain::gain)) {
-                    float gain = 1.0f;
-                    if (::recv(client_fd, &gain, sizeof(gain), MSG_DONTWAIT) == sizeof(gain)) {
-                        rack.audio_state.volume.store(gain, std::memory_order_relaxed);
-                    }
-                } else if (hdr.type == vessel::MsgType::SET_BYPASS
-                           && payload_size == sizeof(vessel::MsgSetBypass::bypassed)) {
-                    uint8_t val = 0;
-                    if (::recv(client_fd, &val, sizeof(val), MSG_DONTWAIT) == sizeof(val)) {
-                        rack.audio_state.bypassed.store(val != 0, std::memory_order_relaxed);
-                    }
-                }
-            }
+        // Send peak levels to the GUI roughly every 50 ms.
+        const auto now = std::chrono::steady_clock::now();
+        if (client_fd >= 0
+            && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_peak_send).count() >= 50) {
+            vessel::MsgPeakLevels msg;
+            msg.in_peak  = rack.audio_state.in_peak.exchange(0.0f, std::memory_order_relaxed);
+            msg.out_peak = rack.audio_state.out_peak.exchange(0.0f, std::memory_order_relaxed);
+            ::send(client_fd, &msg, sizeof(msg), MSG_NOSIGNAL);
+            last_peak_send = now;
         }
     }
 

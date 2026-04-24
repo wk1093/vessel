@@ -18,8 +18,9 @@ inline std::string socket_path(const std::string& rack_name) {
 }
 
 enum class MsgType : uint8_t {
-    SET_GAIN   = 0x01,
-    SET_BYPASS = 0x02,
+    SET_GAIN    = 0x01,
+    SET_BYPASS  = 0x02,
+    PEAK_LEVELS = 0x03,  // runner -> GUI
 };
 
 // Every message begins with this 2-byte header.
@@ -37,6 +38,12 @@ struct __attribute__((packed)) MsgSetGain {
 struct __attribute__((packed)) MsgSetBypass {
     MsgHeader hdr{MsgType::SET_BYPASS, sizeof(MsgSetBypass)};
     uint8_t bypassed{0};
+};
+
+struct __attribute__((packed)) MsgPeakLevels {
+    MsgHeader hdr{MsgType::PEAK_LEVELS, sizeof(MsgPeakLevels)};
+    float in_peak{0.0f};
+    float out_peak{0.0f};
 };
 
 }  // namespace vessel
