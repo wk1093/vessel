@@ -26,12 +26,16 @@ public:
     virtual std::vector<PluginParamSpec> param_specs() const = 0;
     virtual float get_param(uint32_t param_id) const = 0;
     virtual void set_param(uint32_t param_id, float value) = 0;
+
+    virtual bool has_custom_ui() const { return false; }
+    virtual bool open_custom_ui() { return false; }
 };
 
 struct DiscoveredLv2Plugin {
     uint32_t plugin_type_id = 0;
     std::string name;
     std::string uri;
+    bool has_ui = false;
 };
 
 std::unique_ptr<RackPlugin> create_plugin(uint32_t plugin_type_id);

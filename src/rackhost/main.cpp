@@ -401,6 +401,7 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                     added_msg.plugin_type_id = type_id;
                     std::strncpy(added_msg.name, display_name, vessel::kMaxPluginNameLen);
                     added_msg.name[vessel::kMaxPluginNameLen] = '\0';
+                    added_msg.has_custom_ui = added->has_custom_ui() ? 1 : 0;
                     send_ipc(client_fd, added_msg);
                     send_plugin_params(client_fd, instance_id, *added);
                 }
@@ -444,6 +445,14 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
             const auto* msg = reinterpret_cast<const vessel::MsgMovePlugin*>(frame);
             pw_thread_loop_lock(thread_loop);
             move_plugin_instance(rack.plugins, msg->instance_id, msg->target_index);
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::OPEN_PLUGIN_UI && frame_size == sizeof(vessel::MsgOpenPluginUi)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgOpenPluginUi*>(frame);
+            pw_thread_loop_lock(thread_loop);
+            RackPlugin* plugin = find_plugin(rack, msg->instance_id);
+            if (plugin && plugin->has_custom_ui()) {
+                plugin->open_custom_ui();
+            }
             pw_thread_loop_unlock(thread_loop);
         }
 

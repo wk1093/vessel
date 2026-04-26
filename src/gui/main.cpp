@@ -44,6 +44,7 @@ struct RackPluginInstance {
     uint32_t plugin_type_id = 0;
     std::string name;
     bool bypassed = false;
+    bool has_custom_ui = false;
     bool is_open = true;
     std::vector<RackPluginParam> params;
 };
@@ -271,6 +272,7 @@ void drain_ipc(Rack& rack) {
                 plugin.instance_id = msg->instance_id;
                 plugin.plugin_type_id = msg->plugin_type_id;
                 plugin.name = msg->name;
+                plugin.has_custom_ui = msg->has_custom_ui != 0;
                 rack.plugins.push_back(std::move(plugin));
             }
         } else if (hdr->type == vessel::MsgType::PLUGIN_PARAM_DESC
@@ -570,7 +572,37 @@ int main(int, char* argv[]) {
                 }
                 ImGui::SameLine();
 
-                const bool header_open = ImGui::CollapsingHeader(plugin.name.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+                const bool header_open = ImGui::CollapsingHeader(
+                    plugin.name.c_str(),
+                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
+
+                const float remove_button_width = ImGui::GetFrameHeight();
+                const float button_spacing = ImGui::GetStyle().ItemSpacing.x;
+                const float open_button_width = plugin.has_custom_ui ? ImGui::CalcTextSize("Open GUI").x + ImGui::GetStyle().FramePadding.x * 2.0f : 0.0f;
+                const float right_edge = ImGui::GetWindowContentRegionMax().x;
+
+                if (plugin.has_custom_ui) {
+                    const float open_button_x = right_edge - remove_button_width - button_spacing - open_button_width;
+                    ImGui::SameLine();
+                    ImGui::SetCursorPosX(open_button_x);
+                    ImGui::SetNextItemAllowOverlap();
+                    if (ImGui::Button("Open GUI")) {
+                        vessel::MsgOpenPluginUi msg;
+                        msg.instance_id = plugin.instance_id;
+                        send_ipc(rack, msg);
+                    }
+                }
+
+                const float remove_button_x = right_edge - remove_button_width;
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(remove_button_x);
+                ImGui::SetNextItemAllowOverlap();
+                if (ImGui::SmallButton("X")) {
+                    vessel::MsgRemovePlugin msg;
+                    msg.instance_id = plugin.instance_id;
+                    send_ipc(rack, msg);
+                    remove_requested = true;
+                }
 
                 if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
                     const uint32_t dragged_instance_id = plugin.instance_id;
@@ -587,13 +619,6 @@ int main(int, char* argv[]) {
                         }
                     }
                     ImGui::EndDragDropTarget();
-                }
-
-                if (ImGui::Button("Remove Plugin")) {
-                    vessel::MsgRemovePlugin msg;
-                    msg.instance_id = plugin.instance_id;
-                    send_ipc(rack, msg);
-                    remove_requested = true;
                 }
 
                 if (header_open) {

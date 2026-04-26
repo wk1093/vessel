@@ -9,6 +9,7 @@
 
 #include <lilv/lilv.h>
 #include <lv2/core/lv2.h>
+#include <lv2/ui/ui.h>
 
 #include "plugins.h"
 
@@ -335,6 +336,12 @@ public:
         }
     }
 
+    bool has_custom_ui() const override {
+        // Vessel currently does not embed/attach LV2 UIs to already running plugin instances.
+        // Launching jalv creates a separate plugin instance, which is misleading.
+        return false;
+    }
+
 private:
     struct ControlParam {
         uint32_t param_id = 0;
@@ -445,7 +452,13 @@ std::vector<DiscoveredLv2Plugin> scan_lv2_plugins() {
             continue;
         }
 
-        out.push_back({next_type_id++, name, uri});
+        bool has_ui = false;
+        const LilvUIs* uis = lilv_plugin_get_uis(plugin);
+        if (uis && lilv_uis_size(uis) > 0) {
+            has_ui = true;
+        }
+
+        out.push_back({next_type_id++, name, uri, has_ui});
     }
 
     lilv_node_free(audio_class);
