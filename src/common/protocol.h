@@ -28,6 +28,8 @@ enum class MsgType : uint8_t {
     REMOVE_PLUGIN        = 0x17,  // GUI -> runner
     SET_PLUGIN_BYPASS    = 0x18,  // GUI -> runner
     MOVE_PLUGIN          = 0x19,  // GUI -> runner
+    REQ_LV2_CATALOG      = 0x1A,  // GUI -> runner
+    LV2_CATALOG_ENTRY    = 0x1B,  // runner -> GUI
 };
 
 enum class ParamWidget : uint8_t {
@@ -121,6 +123,17 @@ struct __attribute__((packed)) MsgMovePlugin {
     MsgHeader hdr{MsgType::MOVE_PLUGIN, sizeof(MsgMovePlugin)};
     uint32_t instance_id{0};
     uint32_t target_index{0};
+};
+
+struct __attribute__((packed)) MsgReqLv2Catalog {
+    MsgHeader hdr{MsgType::REQ_LV2_CATALOG, sizeof(MsgReqLv2Catalog)};
+};
+
+struct __attribute__((packed)) MsgLv2CatalogEntry {
+    MsgHeader hdr{MsgType::LV2_CATALOG_ENTRY, sizeof(MsgLv2CatalogEntry)};
+    uint32_t plugin_type_id{0};
+    char name[kMaxPluginNameLen + 1]{};
+    uint8_t is_last{0};
 };
 
 }  // namespace vessel

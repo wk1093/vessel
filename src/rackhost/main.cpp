@@ -46,6 +46,7 @@ struct RunnerRack {
 
     AudioState audio_state;
     std::vector<PluginInstance> plugins;
+    std::vector<DiscoveredLv2Plugin> lv2_plugins;
     uint32_t next_plugin_instance_id = 1;
 
     std::vector<uint8_t> rx_buffer;
@@ -110,6 +111,15 @@ bool move_plugin_instance(std::vector<PluginInstance>& plugins, uint32_t instanc
     return true;
 }
 
+const DiscoveredLv2Plugin* find_lv2_plugin(const RunnerRack& rack, uint32_t plugin_type_id) {
+    for (const auto& entry : rack.lv2_plugins) {
+        if (entry.plugin_type_id == plugin_type_id) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
 template <typename T>
 void send_ipc(int client_fd, const T& msg) {
     if (client_fd < 0) return;
@@ -136,6 +146,17 @@ void send_plugin_catalog(int client_fd) {
         std::strncpy(msg.name, supported[i]->name, vessel::kMaxPluginNameLen);
         msg.name[vessel::kMaxPluginNameLen] = '\0';
         msg.is_last = (i + 1 == supported.size()) ? 1 : 0;
+        send_ipc(client_fd, msg);
+    }
+}
+
+void send_lv2_catalog(const RunnerRack& rack, int client_fd) {
+    for (size_t i = 0; i < rack.lv2_plugins.size(); ++i) {
+        vessel::MsgLv2CatalogEntry msg;
+        msg.plugin_type_id = rack.lv2_plugins[i].plugin_type_id;
+        std::strncpy(msg.name, rack.lv2_plugins[i].name.c_str(), vessel::kMaxPluginNameLen);
+        msg.name[vessel::kMaxPluginNameLen] = '\0';
+        msg.is_last = (i + 1 == rack.lv2_plugins.size()) ? 1 : 0;
         send_ipc(client_fd, msg);
     }
 }
@@ -210,7 +231,7 @@ static void on_process(void* data, struct spa_io_position* position) {
 
             for (auto& instance : rack->plugins) {
                 if (!instance.bypassed) {
-                    s = instance.plugin->process_sample(s, sample_rate);
+                    s = instance.plugin->process_sample(s, sample_rate, ch);
                 }
             }
 
@@ -355,12 +376,20 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
             rack.audio_state.bypassed.store(msg->bypassed != 0, std::memory_order_relaxed);
         } else if (hdr->type == vessel::MsgType::REQ_PLUGIN_CATALOG && frame_size == sizeof(vessel::MsgReqPluginCatalog)) {
             send_plugin_catalog(client_fd);
+        } else if (hdr->type == vessel::MsgType::REQ_LV2_CATALOG && frame_size == sizeof(vessel::MsgReqLv2Catalog)) {
+            send_lv2_catalog(rack, client_fd);
         } else if (hdr->type == vessel::MsgType::ADD_PLUGIN && frame_size == sizeof(vessel::MsgAddPlugin)) {
             const auto* msg = reinterpret_cast<const vessel::MsgAddPlugin*>(frame);
             std::unique_ptr<RackPlugin> plugin = create_plugin(msg->plugin_type_id);
+            if (!plugin) {
+                const DiscoveredLv2Plugin* lv2 = find_lv2_plugin(rack, msg->plugin_type_id);
+                if (lv2) {
+                    plugin = create_lv2_plugin(*lv2);
+                }
+            }
             if (plugin) {
                 const uint32_t instance_id = rack.next_plugin_instance_id++;
-                const uint32_t type_id = plugin->type_id();
+                const uint32_t type_id = msg->plugin_type_id;
                 const char* display_name = plugin->display_name();
 
                 pw_thread_loop_lock(thread_loop);
@@ -447,6 +476,7 @@ int main(int argc, char* argv[]) {
     }
 
     RunnerRack rack;
+    rack.lv2_plugins = scan_lv2_plugins();
 
     pw_thread_loop_lock(thread_loop);
     bool ok = setup_audio(rack, pw_thread_loop_get_loop(thread_loop), rack_id);

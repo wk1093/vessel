@@ -63,7 +63,9 @@ struct Rack {
     float out_peak = 0.0f;
 
     bool open_plugin_browser = false;
+    bool open_lv2_browser = false;
     std::vector<RackPluginType> available_plugins;
+    std::vector<RackPluginType> available_lv2_plugins;
     std::vector<RackPluginInstance> plugins;
     std::vector<uint8_t> rx_buffer;
 
@@ -247,6 +249,19 @@ void drain_ipc(Rack& rack) {
             }
             if (!exists) {
                 rack.available_plugins.push_back({msg->plugin_type_id, msg->name});
+            }
+        } else if (hdr->type == vessel::MsgType::LV2_CATALOG_ENTRY
+                   && frame_size == sizeof(vessel::MsgLv2CatalogEntry)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgLv2CatalogEntry*>(frame);
+            bool exists = false;
+            for (const auto& existing : rack.available_lv2_plugins) {
+                if (existing.plugin_type_id == msg->plugin_type_id) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                rack.available_lv2_plugins.push_back({msg->plugin_type_id, msg->name});
             }
         } else if (hdr->type == vessel::MsgType::PLUGIN_INSTANCE_ADDED
                    && frame_size == sizeof(vessel::MsgPluginInstanceAdded)) {
@@ -462,6 +477,13 @@ int main(int, char* argv[]) {
                 }
                 rack.open_plugin_browser = true;
             }
+            ImGui::SameLine();
+            if (ImGui::Button("+ Add LV2 Plugin")) {
+                rack.available_lv2_plugins.clear();
+                vessel::MsgReqLv2Catalog msg;
+                send_ipc(rack, msg);
+                rack.open_lv2_browser = true;
+            }
 
             std::string popup_name = "Plugin Browser##" + std::to_string(rack.id);
             if (rack.open_plugin_browser) {
@@ -470,7 +492,7 @@ int main(int, char* argv[]) {
             }
 
             if (ImGui::BeginPopupModal(popup_name.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::TextUnformatted("Available Plugins");
+                ImGui::TextUnformatted("Built-in Plugins");
                 ImGui::Separator();
 
                 for (const auto& plugin_type : rack.available_plugins) {
@@ -484,6 +506,36 @@ int main(int, char* argv[]) {
 
                 if (rack.available_plugins.empty()) {
                     ImGui::TextUnformatted("No plugins listed in plugins.h manifest.");
+                }
+
+                ImGui::Separator();
+                if (ImGui::Button("Close", ImVec2(120, 0))) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            std::string lv2_popup_name = "LV2 Browser##" + std::to_string(rack.id);
+            if (rack.open_lv2_browser) {
+                ImGui::OpenPopup(lv2_popup_name.c_str());
+                rack.open_lv2_browser = false;
+            }
+
+            if (ImGui::BeginPopupModal(lv2_popup_name.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted("Discovered LV2 Plugins");
+                ImGui::Separator();
+
+                for (const auto& plugin_type : rack.available_lv2_plugins) {
+                    if (ImGui::Selectable(plugin_type.name.c_str())) {
+                        vessel::MsgAddPlugin msg;
+                        msg.plugin_type_id = plugin_type.plugin_type_id;
+                        send_ipc(rack, msg);
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+
+                if (rack.available_lv2_plugins.empty()) {
+                    ImGui::TextUnformatted("Scanning/No compatible LV2 audio plugins found.");
                 }
 
                 ImGui::Separator();
