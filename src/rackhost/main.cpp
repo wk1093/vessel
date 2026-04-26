@@ -17,6 +17,7 @@
 
 #include <pipewire/filter.h>
 #include <pipewire/pipewire.h>
+#include <suil/suil.h>
 
 #include "plugins.h"
 #include "plugins_runtime.h"
@@ -469,6 +470,7 @@ int main(int argc, char* argv[]) {
     const uint32_t rack_id = parse_rack_id(argc, argv);
 
     pw_init(&argc, &argv);
+    suil_init(&argc, &argv, SUIL_ARG_NONE);
 
     struct pw_thread_loop* thread_loop = pw_thread_loop_new("VesselRunnerLoop", nullptr);
     if (!thread_loop) {
@@ -553,6 +555,10 @@ int main(int argc, char* argv[]) {
                     handle_messages(rack, client_fd, thread_loop);
                 }
             }
+        }
+
+        for (auto& instance : rack.plugins) {
+            instance.plugin->pump_ui();
         }
 
         const auto now = std::chrono::steady_clock::now();

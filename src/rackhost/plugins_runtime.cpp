@@ -10,6 +10,7 @@
 #include <lilv/lilv.h>
 #include <lv2/core/lv2.h>
 #include <lv2/ui/ui.h>
+#include <suil/suil.h>
 
 #include "plugins.h"
 
@@ -182,6 +183,8 @@ public:
             return;
         }
 
+        choose_supported_ui();
+
         LilvNode* audio_class = lilv_new_uri(world_, LV2_CORE__AudioPort);
         LilvNode* control_class = lilv_new_uri(world_, LV2_CORE__ControlPort);
         LilvNode* input_class = lilv_new_uri(world_, LV2_CORE__InputPort);
@@ -262,6 +265,8 @@ public:
     }
 
     ~Lv2RackPlugin() override {
+        close_custom_ui();
+
         if (instance_l_) {
             lilv_instance_deactivate(instance_l_);
             lilv_instance_free(instance_l_);
@@ -331,18 +336,166 @@ public:
                 controls_[i].value = clamped;
                 control_values_l_[i] = clamped;
                 control_values_r_[i] = clamped;
+                if (ui_instance_) {
+                    suil_instance_port_event(ui_instance_, controls_[i].port_index, sizeof(float), 0, &clamped);
+                }
                 return;
             }
         }
     }
 
     bool has_custom_ui() const override {
-        // Vessel currently does not embed/attach LV2 UIs to already running plugin instances.
-        // Launching jalv creates a separate plugin instance, which is misleading.
+        return !ui_uri_.empty();
+    }
+
+    bool open_custom_ui() override {
+        if (!has_custom_ui()) {
+            return false;
+        }
+
+        if (!ui_instance_) {
+            ui_host_ = suil_host_new(&Lv2RackPlugin::ui_write_cb, nullptr, nullptr, nullptr);
+            if (!ui_host_) {
+                return false;
+            }
+
+            const char* plugin_uri = lilv_node_as_uri(lilv_plugin_get_uri(plugin_));
+            ui_instance_ = suil_instance_new(
+                ui_host_,
+                this,
+                nullptr,
+                plugin_uri,
+                ui_uri_.c_str(),
+                ui_type_uri_.c_str(),
+                ui_bundle_path_.c_str(),
+                ui_binary_path_.c_str(),
+                nullptr);
+
+            if (!ui_instance_) {
+                suil_host_free(ui_host_);
+                ui_host_ = nullptr;
+                return false;
+            }
+
+            ui_idle_iface_ = static_cast<const LV2UI_Idle_Interface*>(
+                suil_instance_extension_data(ui_instance_, LV2_UI__idleInterface));
+            ui_show_iface_ = static_cast<const LV2UI_Show_Interface*>(
+                suil_instance_extension_data(ui_instance_, LV2_UI__showInterface));
+
+            for (const auto& p : controls_) {
+                suil_instance_port_event(ui_instance_, p.port_index, sizeof(float), 0, &p.value);
+            }
+        }
+
+        if (ui_show_iface_ && ui_show_iface_->show) {
+            return ui_show_iface_->show(suil_instance_get_handle(ui_instance_)) == 0;
+        }
+
         return false;
     }
 
+    void pump_ui() override {
+        if (!ui_instance_ || !ui_idle_iface_ || !ui_idle_iface_->idle) {
+            return;
+        }
+        if (ui_idle_iface_->idle(suil_instance_get_handle(ui_instance_)) != 0) {
+            close_custom_ui();
+        }
+    }
+
 private:
+    static void ui_write_cb(SuilController controller, uint32_t port_index, uint32_t buffer_size, uint32_t protocol, const void* buffer) {
+        if (!controller || protocol != 0 || buffer_size != sizeof(float) || !buffer) {
+            return;
+        }
+        static_cast<Lv2RackPlugin*>(controller)->on_ui_write(port_index, *static_cast<const float*>(buffer));
+    }
+
+    void on_ui_write(uint32_t port_index, float value) {
+        for (size_t i = 0; i < controls_.size(); ++i) {
+            if (controls_[i].port_index == port_index) {
+                set_param(controls_[i].param_id, value);
+                return;
+            }
+        }
+    }
+
+    void close_custom_ui() {
+        if (ui_instance_) {
+            if (ui_show_iface_ && ui_show_iface_->hide) {
+                ui_show_iface_->hide(suil_instance_get_handle(ui_instance_));
+            }
+            suil_instance_free(ui_instance_);
+            ui_instance_ = nullptr;
+        }
+        ui_idle_iface_ = nullptr;
+        ui_show_iface_ = nullptr;
+        if (ui_host_) {
+            suil_host_free(ui_host_);
+            ui_host_ = nullptr;
+        }
+    }
+
+    void choose_supported_ui() {
+        LilvUIs* uis = lilv_plugin_get_uis(plugin_);
+        if (!uis) {
+            return;
+        }
+
+        auto choose_for_container = [&](const char* container_uri) {
+            LilvNode* container = lilv_new_uri(world_, container_uri);
+            if (!container) {
+                return false;
+            }
+
+            unsigned best_quality = 0;
+            const LilvUI* best_ui = nullptr;
+            const LilvNode* best_ui_type = nullptr;
+
+            LILV_FOREACH(uis, it, uis) {
+                const LilvUI* ui = lilv_uis_get(uis, it);
+                const LilvNode* ui_type = nullptr;
+                const unsigned quality = lilv_ui_is_supported(ui, suil_ui_supported, container, &ui_type);
+                if (quality > 0 && (best_quality == 0 || quality < best_quality)) {
+                    best_quality = quality;
+                    best_ui = ui;
+                    best_ui_type = ui_type;
+                }
+            }
+
+            if (best_ui && best_ui_type) {
+                const LilvNode* ui_uri_node = lilv_ui_get_uri(best_ui);
+                const LilvNode* bundle_uri_node = lilv_ui_get_bundle_uri(best_ui);
+                const LilvNode* binary_uri_node = lilv_ui_get_binary_uri(best_ui);
+                if (ui_uri_node && bundle_uri_node && binary_uri_node) {
+                    ui_uri_ = lilv_node_as_uri(ui_uri_node);
+                    ui_type_uri_ = lilv_node_as_uri(best_ui_type);
+                    char* bundle_path = lilv_node_get_path(bundle_uri_node, nullptr);
+                    char* binary_path = lilv_node_get_path(binary_uri_node, nullptr);
+                    if (bundle_path && binary_path) {
+                        ui_bundle_path_ = bundle_path;
+                        ui_binary_path_ = binary_path;
+                    }
+                    if (bundle_path) {
+                        lilv_free(bundle_path);
+                    }
+                    if (binary_path) {
+                        lilv_free(binary_path);
+                    }
+                }
+            }
+
+            lilv_node_free(container);
+            return !ui_uri_.empty() && !ui_type_uri_.empty() && !ui_bundle_path_.empty() && !ui_binary_path_.empty();
+        };
+
+        if (!choose_for_container(LV2_UI__Qt5UI)) {
+            choose_for_container(LV2_UI__X11UI);
+        }
+
+        lilv_uis_free(uis);
+    }
+
     struct ControlParam {
         uint32_t param_id = 0;
         uint32_t port_index = 0;
@@ -362,6 +515,15 @@ private:
     const LilvPlugin* plugin_ = nullptr;
     LilvInstance* instance_l_ = nullptr;
     LilvInstance* instance_r_ = nullptr;
+
+    std::string ui_uri_;
+    std::string ui_type_uri_;
+    std::string ui_bundle_path_;
+    std::string ui_binary_path_;
+    SuilHost* ui_host_ = nullptr;
+    SuilInstance* ui_instance_ = nullptr;
+    const LV2UI_Idle_Interface* ui_idle_iface_ = nullptr;
+    const LV2UI_Show_Interface* ui_show_iface_ = nullptr;
 
     uint32_t audio_in_port_ = std::numeric_limits<uint32_t>::max();
     uint32_t audio_out_port_ = std::numeric_limits<uint32_t>::max();

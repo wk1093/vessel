@@ -29,6 +29,7 @@ public:
 
     virtual bool has_custom_ui() const { return false; }
     virtual bool open_custom_ui() { return false; }
+    virtual void pump_ui() {}
 };
 
 struct DiscoveredLv2Plugin {

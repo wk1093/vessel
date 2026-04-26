@@ -1,0 +1,7 @@
+- [ ] Add support for different types of LV2 aruments (e.g. float, int, bool, enum, logarithmicm, etc.)
+- [ ] Add LV2 ui inside of an imgui window instead of a separate window.
+- [ ] Add support for LV2 state saving and loading.
+- [ ] Add support for saving entire rack to a file and loading it back (all plugins and their states).
+- [ ] Make audio more stable and support more sample rates, buffer sizes, and channel configurations (e.g. mono, stereo, 5.1, etc.).
+- [ ] Add support for MIDI input and output (e.g. for controlling plugins with MIDI controllers or sending MIDI messages to other software).
+- [ ] Add support for plugin presets (e.g. saving and loading presets for individual plugins).
