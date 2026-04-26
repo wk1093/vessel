@@ -2,7 +2,6 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
@@ -19,12 +18,12 @@
 #include <pipewire/filter.h>
 #include <pipewire/pipewire.h>
 
+#include "plugins.h"
+#include "plugins_runtime.h"
 #include "protocol.h"
 
 namespace {
 std::atomic<bool> g_running{true};
-
-constexpr uint32_t kPluginTypeSineMixer = 1;
 
 struct AudioState {
     std::atomic<float> volume{1.0f};
@@ -33,77 +32,10 @@ struct AudioState {
     std::atomic<float> out_peak{0.0f};
 };
 
-struct PluginParamSpec {
-    uint32_t id;
-    const char* name;
-    vessel::ParamWidget widget;
-    float min_value;
-    float max_value;
-    float default_value;
-};
-
-class RackPlugin {
-public:
-    virtual ~RackPlugin() = default;
-
-    virtual uint32_t type_id() const = 0;
-    virtual const char* display_name() const = 0;
-    virtual float process_sample(float in, float sample_rate) = 0;
-    virtual std::vector<PluginParamSpec> param_specs() const = 0;
-    virtual float get_param(uint32_t param_id) const = 0;
-    virtual void set_param(uint32_t param_id, float value) = 0;
-};
-
-class SineMixerPlugin final : public RackPlugin {
-public:
-    static constexpr uint32_t kParamInputVol = 1;
-    static constexpr uint32_t kParamSineVol = 2;
-
-    uint32_t type_id() const override { return kPluginTypeSineMixer; }
-    const char* display_name() const override { return "Sine Mixer (Test)"; }
-
-    float process_sample(float in, float sample_rate) override {
-        const float input_vol = input_vol_.load(std::memory_order_relaxed);
-        const float sine_vol = sine_vol_.load(std::memory_order_relaxed);
-
-        const float sine = std::sin(phase_);
-        phase_ += (2.0f * 3.14159265358979323846f * 220.0f) / std::max(sample_rate, 1.0f);
-        if (phase_ > 2.0f * 3.14159265358979323846f) {
-            phase_ -= 2.0f * 3.14159265358979323846f;
-        }
-
-        return in * input_vol + sine * sine_vol;
-    }
-
-    std::vector<PluginParamSpec> param_specs() const override {
-        return {
-            {kParamInputVol, "Input Vol", vessel::ParamWidget::SLIDER, 0.0f, 2.0f, 1.0f},
-            {kParamSineVol, "Sine Vol", vessel::ParamWidget::SLIDER, 0.0f, 1.0f, 0.0f},
-        };
-    }
-
-    float get_param(uint32_t param_id) const override {
-        if (param_id == kParamInputVol) return input_vol_.load(std::memory_order_relaxed);
-        if (param_id == kParamSineVol) return sine_vol_.load(std::memory_order_relaxed);
-        return 0.0f;
-    }
-
-    void set_param(uint32_t param_id, float value) override {
-        if (param_id == kParamInputVol) {
-            input_vol_.store(std::clamp(value, 0.0f, 2.0f), std::memory_order_relaxed);
-        } else if (param_id == kParamSineVol) {
-            sine_vol_.store(std::clamp(value, 0.0f, 1.0f), std::memory_order_relaxed);
-        }
-    }
-
-private:
-    std::atomic<float> input_vol_{1.0f};
-    std::atomic<float> sine_vol_{0.0f};
-    float phase_ = 0.0f;
-};
 
 struct PluginInstance {
     uint32_t instance_id = 0;
+    bool bypassed = false;
     std::unique_ptr<RackPlugin> plugin;
 };
 
@@ -139,6 +71,45 @@ RackPlugin* find_plugin(RunnerRack& rack, uint32_t instance_id) {
     return nullptr;
 }
 
+PluginInstance* find_plugin_instance(RunnerRack& rack, uint32_t instance_id) {
+    for (auto& instance : rack.plugins) {
+        if (instance.instance_id == instance_id) {
+            return &instance;
+        }
+    }
+    return nullptr;
+}
+
+bool move_plugin_instance(std::vector<PluginInstance>& plugins, uint32_t instance_id, uint32_t target_index) {
+    if (plugins.empty()) {
+        return false;
+    }
+
+    size_t from = plugins.size();
+    for (size_t i = 0; i < plugins.size(); ++i) {
+        if (plugins[i].instance_id == instance_id) {
+            from = i;
+            break;
+        }
+    }
+    if (from == plugins.size()) {
+        return false;
+    }
+
+    size_t to = std::min<size_t>(target_index, plugins.size() - 1);
+    if (from == to) {
+        return false;
+    }
+
+    PluginInstance moved = std::move(plugins[from]);
+    plugins.erase(plugins.begin() + static_cast<long>(from));
+    if (to > from) {
+        --to;
+    }
+    plugins.insert(plugins.begin() + static_cast<long>(to), std::move(moved));
+    return true;
+}
+
 template <typename T>
 void send_ipc(int client_fd, const T& msg) {
     if (client_fd < 0) return;
@@ -149,12 +120,24 @@ void send_ipc(int client_fd, const T& msg) {
 }
 
 void send_plugin_catalog(int client_fd) {
-    vessel::MsgPluginCatalogEntry entry;
-    entry.plugin_type_id = kPluginTypeSineMixer;
-    std::strncpy(entry.name, "Sine Mixer (Test)", vessel::kMaxPluginNameLen);
-    entry.name[vessel::kMaxPluginNameLen] = '\0';
-    entry.is_last = 1;
-    send_ipc(client_fd, entry);
+    std::vector<const vessel::PluginManifestEntry*> supported;
+    supported.reserve(vessel::kDefaultPluginCount);
+
+    for (size_t i = 0; i < vessel::kDefaultPluginCount; ++i) {
+        const vessel::PluginManifestEntry& entry = vessel::kDefaultPlugins[i];
+        if (plugin_is_supported(entry.plugin_type_id)) {
+            supported.push_back(&entry);
+        }
+    }
+
+    for (size_t i = 0; i < supported.size(); ++i) {
+        vessel::MsgPluginCatalogEntry msg;
+        msg.plugin_type_id = supported[i]->plugin_type_id;
+        std::strncpy(msg.name, supported[i]->name, vessel::kMaxPluginNameLen);
+        msg.name[vessel::kMaxPluginNameLen] = '\0';
+        msg.is_last = (i + 1 == supported.size()) ? 1 : 0;
+        send_ipc(client_fd, msg);
+    }
 }
 
 void send_plugin_params(int client_fd, uint32_t instance_id, RackPlugin& plugin) {
@@ -173,13 +156,6 @@ void send_plugin_params(int client_fd, uint32_t instance_id, RackPlugin& plugin)
         msg.is_last = (i + 1 == specs.size()) ? 1 : 0;
         send_ipc(client_fd, msg);
     }
-}
-
-std::unique_ptr<RackPlugin> create_plugin(uint32_t plugin_type_id) {
-    if (plugin_type_id == kPluginTypeSineMixer) {
-        return std::make_unique<SineMixerPlugin>();
-    }
-    return nullptr;
 }
 
 static void on_process(void* data, struct spa_io_position* position) {
@@ -233,7 +209,9 @@ static void on_process(void* data, struct spa_io_position* position) {
             }
 
             for (auto& instance : rack->plugins) {
-                s = instance.plugin->process_sample(s, sample_rate);
+                if (!instance.bypassed) {
+                    s = instance.plugin->process_sample(s, sample_rate);
+                }
             }
 
             out[i] = s;
@@ -386,7 +364,7 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                 const char* display_name = plugin->display_name();
 
                 pw_thread_loop_lock(thread_loop);
-                rack.plugins.push_back({instance_id, std::move(plugin)});
+                rack.plugins.push_back({instance_id, false, std::move(plugin)});
                 RackPlugin* added = find_plugin(rack, instance_id);
                 if (added) {
                     vessel::MsgPluginInstanceAdded added_msg;
@@ -424,6 +402,19 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                     rack.plugins.end(),
                     [&](const PluginInstance& p) { return p.instance_id == msg->instance_id; }),
                 rack.plugins.end());
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::SET_PLUGIN_BYPASS && frame_size == sizeof(vessel::MsgSetPluginBypass)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgSetPluginBypass*>(frame);
+            pw_thread_loop_lock(thread_loop);
+            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+            if (instance) {
+                instance->bypassed = msg->bypassed != 0;
+            }
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::MOVE_PLUGIN && frame_size == sizeof(vessel::MsgMovePlugin)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgMovePlugin*>(frame);
+            pw_thread_loop_lock(thread_loop);
+            move_plugin_instance(rack.plugins, msg->instance_id, msg->target_index);
             pw_thread_loop_unlock(thread_loop);
         }
 

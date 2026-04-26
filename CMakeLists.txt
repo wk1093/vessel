@@ -44,6 +44,7 @@ add_executable(vessel-ui
 
 add_executable(vessel-runner
     src/rackhost/main.cpp
+    src/rackhost/plugins_runtime.cpp
 )
 
 # Keep a convenient legacy target name.

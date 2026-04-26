@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "plugins.h"
 #include "protocol.h"
 
 #include <glad/glad.h>
@@ -42,6 +43,7 @@ struct RackPluginInstance {
     uint32_t instance_id = 0;
     uint32_t plugin_type_id = 0;
     std::string name;
+    bool bypassed = false;
     bool is_open = true;
     std::vector<RackPluginParam> params;
 };
@@ -155,6 +157,36 @@ RackPluginInstance* find_plugin_instance(Rack& rack, uint32_t instance_id) {
         }
     }
     return nullptr;
+}
+
+bool move_plugin_instance(std::vector<RackPluginInstance>& plugins, uint32_t instance_id, size_t target_index) {
+    if (plugins.empty()) {
+        return false;
+    }
+
+    size_t from = plugins.size();
+    for (size_t i = 0; i < plugins.size(); ++i) {
+        if (plugins[i].instance_id == instance_id) {
+            from = i;
+            break;
+        }
+    }
+    if (from == plugins.size()) {
+        return false;
+    }
+
+    size_t to = std::min(target_index, plugins.size() - 1);
+    if (from == to) {
+        return false;
+    }
+
+    RackPluginInstance moved = std::move(plugins[from]);
+    plugins.erase(plugins.begin() + static_cast<long>(from));
+    if (to > from) {
+        --to;
+    }
+    plugins.insert(plugins.begin() + static_cast<long>(to), std::move(moved));
+    return true;
 }
 
 void drain_ipc(Rack& rack) {
@@ -424,8 +456,10 @@ int main(int, char* argv[]) {
 
             if (ImGui::Button("+ Add Plugin")) {
                 rack.available_plugins.clear();
-                vessel::MsgReqPluginCatalog req;
-                send_ipc(rack, req);
+                for (size_t i = 0; i < vessel::kDefaultPluginCount; ++i) {
+                    const vessel::PluginManifestEntry& entry = vessel::kDefaultPlugins[i];
+                    rack.available_plugins.push_back({entry.plugin_type_id, entry.name});
+                }
                 rack.open_plugin_browser = true;
             }
 
@@ -449,7 +483,7 @@ int main(int, char* argv[]) {
                 }
 
                 if (rack.available_plugins.empty()) {
-                    ImGui::TextUnformatted("Waiting for rackhost plugin list...");
+                    ImGui::TextUnformatted("No plugins listed in plugins.h manifest.");
                 }
 
                 ImGui::Separator();
@@ -462,12 +496,47 @@ int main(int, char* argv[]) {
             ImGui::Separator();
             ImGui::TextUnformatted("Plugins");
 
+            uint32_t pending_move_instance = 0;
+            int pending_move_target_index = -1;
+
             for (auto pit = rack.plugins.begin(); pit != rack.plugins.end();) {
                 RackPluginInstance& plugin = *pit;
+                const int plugin_index = static_cast<int>(pit - rack.plugins.begin());
                 ImGui::PushID(static_cast<int>(plugin.instance_id));
 
                 bool remove_requested = false;
+                bool plugin_bypassed = plugin.bypassed;
+                if (ImGui::Checkbox("##plugin_bypass", &plugin_bypassed)) {
+                    plugin.bypassed = plugin_bypassed;
+                    vessel::MsgSetPluginBypass msg;
+                    msg.instance_id = plugin.instance_id;
+                    msg.bypassed = plugin_bypassed ? 1 : 0;
+                    send_ipc(rack, msg);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Bypass plugin");
+                }
+                ImGui::SameLine();
+
                 const bool header_open = ImGui::CollapsingHeader(plugin.name.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
+                    const uint32_t dragged_instance_id = plugin.instance_id;
+                    ImGui::SetDragDropPayload("VESSEL_PLUGIN", &dragged_instance_id, sizeof(dragged_instance_id));
+                    ImGui::Text("Move: %s", plugin.name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("VESSEL_PLUGIN")) {
+                        if (payload->DataSize == static_cast<int>(sizeof(uint32_t))) {
+                            pending_move_instance = *static_cast<const uint32_t*>(payload->Data);
+                            pending_move_target_index = plugin_index;
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+
                 if (ImGui::Button("Remove Plugin")) {
                     vessel::MsgRemovePlugin msg;
                     msg.instance_id = plugin.instance_id;
@@ -519,6 +588,15 @@ int main(int, char* argv[]) {
                     pit = rack.plugins.erase(pit);
                 } else {
                     ++pit;
+                }
+            }
+
+            if (pending_move_instance != 0 && pending_move_target_index >= 0) {
+                if (move_plugin_instance(rack.plugins, pending_move_instance, static_cast<size_t>(pending_move_target_index))) {
+                    vessel::MsgMovePlugin msg;
+                    msg.instance_id = pending_move_instance;
+                    msg.target_index = static_cast<uint32_t>(pending_move_target_index);
+                    send_ipc(rack, msg);
                 }
             }
 

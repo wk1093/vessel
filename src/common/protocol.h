@@ -26,6 +26,8 @@ enum class MsgType : uint8_t {
     PLUGIN_PARAM_DESC    = 0x15,  // runner -> GUI
     SET_PLUGIN_PARAM     = 0x16,  // GUI -> runner
     REMOVE_PLUGIN        = 0x17,  // GUI -> runner
+    SET_PLUGIN_BYPASS    = 0x18,  // GUI -> runner
+    MOVE_PLUGIN          = 0x19,  // GUI -> runner
 };
 
 enum class ParamWidget : uint8_t {
@@ -107,6 +109,18 @@ struct __attribute__((packed)) MsgSetPluginParam {
 struct __attribute__((packed)) MsgRemovePlugin {
     MsgHeader hdr{MsgType::REMOVE_PLUGIN, sizeof(MsgRemovePlugin)};
     uint32_t instance_id{0};
+};
+
+struct __attribute__((packed)) MsgSetPluginBypass {
+    MsgHeader hdr{MsgType::SET_PLUGIN_BYPASS, sizeof(MsgSetPluginBypass)};
+    uint32_t instance_id{0};
+    uint8_t bypassed{0};
+};
+
+struct __attribute__((packed)) MsgMovePlugin {
+    MsgHeader hdr{MsgType::MOVE_PLUGIN, sizeof(MsgMovePlugin)};
+    uint32_t instance_id{0};
+    uint32_t target_index{0};
 };
 
 }  // namespace vessel
