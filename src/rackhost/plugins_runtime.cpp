@@ -179,13 +179,11 @@ private:
 
 class SoundboardPlugin final : public RackPlugin {
 public:
-    static constexpr uint32_t kPadCount = 4;
-
     uint32_t type_id() const override { return kPluginTypeSoundboard; }
     const char* display_name() const override { return "Soundboard"; }
 
     SoundboardPlugin() {
-        add_sound_slot();
+        add_pad("Pad 1");
     }
 
     float process_sample(float in, float sample_rate, int channel) override {
@@ -194,23 +192,20 @@ public:
         }
 
         const float sr = std::max(sample_rate, 1.0f);
-        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
-            if (pad_trigger_[pad].exchange(false, std::memory_order_relaxed)) {
+        for (size_t pad = 0; pad < pads_.size(); ++pad) {
+            if (pads_[pad]->trigger.exchange(false, std::memory_order_relaxed)) {
                 voices_[pad].active = true;
-                voices_[pad].sound_index = static_cast<size_t>(std::max(0, sound_select_[pad].load(std::memory_order_relaxed)));
                 voices_[pad].position = 0.0f;
-                if (voices_[pad].sound_index < sounds_.size() && sounds_[voices_[pad].sound_index].sample_rate > 0) {
-                    voices_[pad].step = static_cast<float>(sounds_[voices_[pad].sound_index].sample_rate) / sr;
-                } else {
-                    voices_[pad].step = 1.0f;
-                }
+                voices_[pad].step = pads_[pad]->sample_rate > 0
+                    ? static_cast<float>(pads_[pad]->sample_rate) / sr
+                    : 1.0f;
             }
         }
 
         float board = 0.0f;
-        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
-            const float gain = pad_gain_[pad].load(std::memory_order_relaxed);
-            board += render_voice(voices_[pad], sr) * gain;
+        for (size_t pad = 0; pad < pads_.size(); ++pad) {
+            const float gain = pads_[pad]->gain.load(std::memory_order_relaxed);
+            board += render_voice(voices_[pad], *pads_[pad]) * gain;
         }
 
         const float mixed = in + board * master_mix_.load(std::memory_order_relaxed);
@@ -236,62 +231,24 @@ public:
             140.0f,
         });
 
-        if (!customize) {
-            out.reserve(1 + kPadCount);
-            for (uint32_t pad = 0; pad < kPadCount; ++pad) {
-                out.push_back({
-                    pad_trigger_param_id(pad),
-                    kPadTriggerNames[pad],
-                    vessel::ParamWidget::BUTTON,
-                    0.0f,
-                    1.0f,
-                    0.0f,
-                    vessel::ParamValueType::BOOL,
-                    vessel::PARAM_FLAG_NONE,
-                    {},
-                    ((pad % 2) == 0) ? vessel::ParamLayoutHint::AUTO : vessel::ParamLayoutHint::SAME_LINE,
-                    140.0f,
-                });
-            }
-            return out;
-        }
-
-        out.reserve(3 + (kPadCount * 3));
-
-        out.push_back({
-            kParamMasterMix,
-            "Master Mix",
-            vessel::ParamWidget::KNOB,
-            0.0f,
-            1.0f,
-            0.8f,
-            vessel::ParamValueType::FLOAT,
-            vessel::PARAM_FLAG_NONE,
-            {},
-            vessel::ParamLayoutHint::SAME_LINE,
-            0.0f,
-        });
-
-        out.push_back({
-            kParamAddSound,
-            "+ Add Sound",
-            vessel::ParamWidget::BUTTON,
-            0.0f,
-            1.0f,
-            0.0f,
-            vessel::ParamValueType::BOOL,
-            vessel::PARAM_FLAG_NONE,
-            {},
-            vessel::ParamLayoutHint::SAME_LINE,
-            0.0f,
-        });
-
-        const auto options = sound_options();
-        const float max_sound_index = options.empty() ? 0.0f : static_cast<float>(options.size() - 1);
-        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
+        if (customize) {
             out.push_back({
-                pad_trigger_param_id(pad),
-                kPadTriggerNames[pad],
+                kParamMasterMix,
+                "Master Mix",
+                vessel::ParamWidget::KNOB,
+                0.0f,
+                1.0f,
+                0.8f,
+                vessel::ParamValueType::FLOAT,
+                vessel::PARAM_FLAG_NONE,
+                {},
+                vessel::ParamLayoutHint::SAME_LINE,
+                0.0f,
+            });
+
+            out.push_back({
+                kParamAddPad,
+                "+ Add Pad",
                 vessel::ParamWidget::BUTTON,
                 0.0f,
                 1.0f,
@@ -299,35 +256,47 @@ public:
                 vessel::ParamValueType::BOOL,
                 vessel::PARAM_FLAG_NONE,
                 {},
-                vessel::ParamLayoutHint::AUTO,
-                0.0f,
-            });
-            out.push_back({
-                pad_sound_param_id(pad),
-                kPadSoundNames[pad],
-                vessel::ParamWidget::SLIDER,
-                0.0f,
-                max_sound_index,
-                static_cast<float>(std::min<size_t>(pad, options.empty() ? 0 : options.size() - 1)),
-                vessel::ParamValueType::ENUM,
-                vessel::PARAM_FLAG_NONE,
-                options,
                 vessel::ParamLayoutHint::SAME_LINE,
-                170.0f,
+                0.0f,
             });
+        }
+
+        const size_t pad_count = pads_.size();
+        const size_t columns = std::max<size_t>(1, static_cast<size_t>(std::ceil(std::sqrt(static_cast<double>(std::max<size_t>(1, pad_count))))));
+        for (size_t pad = 0; pad < pad_count; ++pad) {
+            const vessel::ParamLayoutHint trigger_layout = (!customize && (pad % columns) != 0)
+                ? vessel::ParamLayoutHint::SAME_LINE
+                : vessel::ParamLayoutHint::AUTO;
+
             out.push_back({
-                pad_gain_param_id(pad),
-                kPadGainNames[pad],
-                vessel::ParamWidget::KNOB,
+                pad_trigger_param_id(static_cast<uint32_t>(pad)),
+                pads_[pad]->name.c_str(),
+                vessel::ParamWidget::BUTTON,
                 0.0f,
                 1.0f,
-                0.75f,
-                vessel::ParamValueType::FLOAT,
+                0.0f,
+                vessel::ParamValueType::BOOL,
                 vessel::PARAM_FLAG_NONE,
                 {},
-                vessel::ParamLayoutHint::SAME_LINE,
-                0.0f,
+                trigger_layout,
+                !customize ? 140.0f : 0.0f,
             });
+
+            if (customize) {
+                out.push_back({
+                    pad_gain_param_id(static_cast<uint32_t>(pad)),
+                    "Gain",
+                    vessel::ParamWidget::KNOB,
+                    0.0f,
+                    1.0f,
+                    0.75f,
+                    vessel::ParamValueType::FLOAT,
+                    vessel::PARAM_FLAG_NONE,
+                    {},
+                    vessel::ParamLayoutHint::SAME_LINE,
+                    0.0f,
+                });
+            }
         }
 
         return out;
@@ -340,20 +309,17 @@ public:
         if (param_id == kParamMasterMix) {
             return master_mix_.load(std::memory_order_relaxed);
         }
-        if (param_id == kParamAddSound) {
+        if (param_id == kParamAddPad) {
             return 0.0f;
         }
 
         uint32_t pad = 0;
-        if (param_id_to_pad(param_id, pad)) {
+        if (param_id_to_pad(param_id, pad) && pad < pads_.size()) {
             if (param_id == pad_trigger_param_id(pad)) {
                 return 0.0f;
             }
-            if (param_id == pad_sound_param_id(pad)) {
-                return static_cast<float>(sound_select_[pad].load(std::memory_order_relaxed));
-            }
             if (param_id == pad_gain_param_id(pad)) {
-                return pad_gain_[pad].load(std::memory_order_relaxed);
+                return pads_[pad]->gain.load(std::memory_order_relaxed);
             }
         }
 
@@ -376,32 +342,26 @@ public:
             return;
         }
 
-        if (param_id == kParamAddSound) {
+        if (param_id == kParamAddPad) {
             if (value > 0.5f) {
-                add_sound_slot();
+                add_pad("Pad " + std::to_string(pads_.size() + 1));
             }
             return;
         }
 
         uint32_t pad = 0;
-        if (!param_id_to_pad(param_id, pad)) {
+        if (!param_id_to_pad(param_id, pad) || pad >= pads_.size()) {
             return;
         }
 
         if (param_id == pad_trigger_param_id(pad)) {
             if (value > 0.5f) {
-                pad_trigger_[pad].store(true, std::memory_order_relaxed);
+                pads_[pad]->trigger.store(true, std::memory_order_relaxed);
             }
             return;
         }
-        if (param_id == pad_sound_param_id(pad)) {
-            const int max_sound = static_cast<int>(sounds_.empty() ? 0 : sounds_.size() - 1);
-            const int sound = std::clamp(static_cast<int>(std::lround(value)), 0, max_sound);
-            sound_select_[pad].store(sound, std::memory_order_relaxed);
-            return;
-        }
         if (param_id == pad_gain_param_id(pad)) {
-            pad_gain_[pad].store(std::clamp(value, 0.0f, 1.0f), std::memory_order_relaxed);
+            pads_[pad]->gain.store(std::clamp(value, 0.0f, 1.0f), std::memory_order_relaxed);
             return;
         }
     }
@@ -412,20 +372,30 @@ public:
             return out;
         }
 
-        out.reserve(sounds_.size() * 2);
-        for (size_t i = 0; i < sounds_.size(); ++i) {
+        out.reserve(pads_.size() * 3);
+        for (size_t i = 0; i < pads_.size(); ++i) {
             out.push_back({
                 load_action_id(i),
-                std::string("Load File: ") + sounds_[i].label,
-                true,
+                std::string("Load Sound: ") + pads_[i]->name,
+                std::string(),
+                vessel::CustomControlTextMode::FILE_PATH,
                 vessel::ParamLayoutHint::AUTO,
-                320.0f,
+                0.0f,
             });
-            if (sounds_.size() > 1) {
+            out.push_back({
+                rename_action_id(i),
+                std::string("Rename: ") + pads_[i]->name,
+                pads_[i]->name,
+                vessel::CustomControlTextMode::PLAIN_TEXT,
+                vessel::ParamLayoutHint::SAME_LINE,
+                200.0f,
+            });
+            if (pads_.size() > 1) {
                 out.push_back({
                     remove_action_id(i),
-                    std::string("Remove: ") + sounds_[i].label,
-                    false,
+                    std::string("Remove Pad: ") + pads_[i]->name,
+                    std::string(),
+                    vessel::CustomControlTextMode::NONE,
                     vessel::ParamLayoutHint::SAME_LINE,
                     0.0f,
                 });
@@ -437,14 +407,19 @@ public:
     void trigger_custom_action(uint32_t action_id) override {
         if (action_id >= kActionRemoveBase && action_id < (kActionRemoveBase + 1000)) {
             const size_t index = static_cast<size_t>(action_id - kActionRemoveBase);
-            remove_sound_slot(index);
+            remove_pad(index);
         }
     }
 
     void set_custom_text(uint32_t action_id, const std::string& text) override {
-        if (action_id >= kActionLoadBase && action_id < (kActionLoadBase + 1000)) {
+        if (action_id >= kActionRenameBase && action_id < (kActionRenameBase + 1000)) {
+            const size_t index = static_cast<size_t>(action_id - kActionRenameBase);
+            rename_pad(index, text);
+            return;
+        }
+        if (action_id >= kActionLoadBase && action_id < kActionRenameBase) {
             const size_t index = static_cast<size_t>(action_id - kActionLoadBase);
-            load_sound_into_slot(index, text);
+            load_sound_into_pad(index, text, false);
         }
     }
 
@@ -454,10 +429,14 @@ public:
 
     std::vector<std::pair<std::string, std::string>> save_state() const override {
         std::vector<std::pair<std::string, std::string>> out;
-        out.emplace_back("sound_count", std::to_string(sounds_.size()));
-        for (size_t i = 0; i < sounds_.size(); ++i) {
-            if (!sounds_[i].path.empty()) {
-                out.emplace_back("sound_path_" + std::to_string(i), sounds_[i].path);
+        out.emplace_back("pad_count", std::to_string(pads_.size()));
+        out.emplace_back("customize", customize_mode_.load(std::memory_order_relaxed) ? "1" : "0");
+        out.emplace_back("master_mix", std::to_string(master_mix_.load(std::memory_order_relaxed)));
+        for (size_t i = 0; i < pads_.size(); ++i) {
+            out.emplace_back("pad_name_" + std::to_string(i), pads_[i]->name);
+            out.emplace_back("pad_gain_" + std::to_string(i), std::to_string(pads_[i]->gain.load(std::memory_order_relaxed)));
+            if (!pads_[i]->path.empty()) {
+                out.emplace_back("pad_path_" + std::to_string(i), pads_[i]->path);
             }
         }
         return out;
@@ -469,10 +448,14 @@ public:
         }
 
         size_t target_count = 1;
+        bool customize = true;
+        float master = 0.8f;
+        std::vector<std::pair<size_t, std::string>> names;
         std::vector<std::pair<size_t, std::string>> paths;
+        std::vector<std::pair<size_t, float>> gains;
 
         for (const auto& kv : state) {
-            if (kv.first == "sound_count") {
+            if (kv.first == "pad_count") {
                 try {
                     target_count = static_cast<size_t>(std::stoul(kv.second));
                 } catch (...) {
@@ -482,121 +465,122 @@ public:
                 continue;
             }
 
-            static constexpr const char* kSoundPathPrefix = "sound_path_";
-            if (kv.first.rfind(kSoundPathPrefix, 0) == 0) {
-                const std::string index_str = kv.first.substr(std::char_traits<char>::length(kSoundPathPrefix));
+            if (kv.first == "customize") {
+                customize = kv.second == "1";
+                continue;
+            }
+            if (kv.first == "master_mix") {
                 try {
-                    const size_t idx = static_cast<size_t>(std::stoul(index_str));
-                    paths.emplace_back(idx, kv.second);
+                    master = std::stof(kv.second);
+                } catch (...) {
+                    master = 0.8f;
+                }
+                continue;
+            }
+
+            auto parse_index = [](const std::string& key, const char* prefix, size_t& out_index) {
+                if (key.rfind(prefix, 0) != 0) {
+                    return false;
+                }
+                const std::string index_str = key.substr(std::char_traits<char>::length(prefix));
+                try {
+                    out_index = static_cast<size_t>(std::stoul(index_str));
+                    return true;
+                } catch (...) {
+                    return false;
+                }
+            };
+
+            size_t idx = 0;
+            if (parse_index(kv.first, "pad_name_", idx)) {
+                names.emplace_back(idx, kv.second);
+                continue;
+            }
+            if (parse_index(kv.first, "pad_path_", idx)) {
+                paths.emplace_back(idx, kv.second);
+                continue;
+            }
+            if (parse_index(kv.first, "pad_gain_", idx)) {
+                try {
+                    gains.emplace_back(idx, std::stof(kv.second));
                 } catch (...) {
                 }
+                continue;
             }
         }
 
-        sounds_.clear();
-        sounds_.reserve(target_count);
+        pads_.clear();
+        voices_.clear();
         for (size_t i = 0; i < target_count; ++i) {
-            LoadedSound slot;
-            slot.label = slot_label(i);
-            slot.sample_rate = 48000;
-            sounds_.push_back(std::move(slot));
+            add_pad("Pad " + std::to_string(i + 1));
         }
 
-        for (auto& voice : voices_) {
-            voice.active = false;
-            voice.sound_index = 0;
-            voice.position = 0.0f;
-            voice.step = 1.0f;
+        for (const auto& entry : names) {
+            if (entry.first < pads_.size() && !entry.second.empty()) {
+                pads_[entry.first]->name = entry.second;
+            }
         }
 
-        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
-            const int clamped = std::clamp(sound_select_[pad].load(std::memory_order_relaxed), 0, static_cast<int>(target_count - 1));
-            sound_select_[pad].store(clamped, std::memory_order_relaxed);
+        for (const auto& entry : gains) {
+            if (entry.first < pads_.size()) {
+                pads_[entry.first]->gain.store(std::clamp(entry.second, 0.0f, 1.0f), std::memory_order_relaxed);
+            }
         }
 
         for (const auto& entry : paths) {
-            if (entry.first < sounds_.size()) {
-                load_sound_into_slot(entry.first, entry.second);
+            if (entry.first < pads_.size()) {
+                load_sound_into_pad(entry.first, entry.second, true);
             }
         }
 
+        customize_mode_.store(customize, std::memory_order_relaxed);
+        master_mix_.store(std::clamp(master, 0.0f, 1.0f), std::memory_order_relaxed);
         ++ui_schema_version_;
     }
 
 private:
-    struct LoadedSound {
-        std::string label;
+    struct PadRuntime {
+        std::string name;
         std::string path;
         std::vector<float> samples;
         uint32_t sample_rate = 48000;
+        std::atomic<float> gain{0.75f};
+        std::atomic<bool> trigger{false};
     };
 
     struct Voice {
         bool active = false;
-        size_t sound_index = 0;
         float position = 0.0f;
         float step = 1.0f;
     };
 
     static constexpr uint32_t kParamMasterMix = 1;
     static constexpr uint32_t kParamCustomizeMode = 2;
-    static constexpr uint32_t kParamAddSound = 3;
+    static constexpr uint32_t kParamAddPad = 3;
     static constexpr uint32_t kParamBase = 100;
-    static constexpr uint32_t kParamsPerPad = 3;
+    static constexpr uint32_t kParamsPerPad = 2;
     static constexpr uint32_t kActionLoadBase = 1000;
+    static constexpr uint32_t kActionRenameBase = 1500;
     static constexpr uint32_t kActionRemoveBase = 2000;
-
-    static constexpr const char* kPadTriggerNames[kPadCount] = {
-        "Pad A Trigger",
-        "Pad B Trigger",
-        "Pad C Trigger",
-        "Pad D Trigger",
-    };
-
-    static constexpr const char* kPadSoundNames[kPadCount] = {
-        "Pad A Sound",
-        "Pad B Sound",
-        "Pad C Sound",
-        "Pad D Sound",
-    };
-
-    static constexpr const char* kPadGainNames[kPadCount] = {
-        "Pad A Gain",
-        "Pad B Gain",
-        "Pad C Gain",
-        "Pad D Gain",
-    };
 
     static uint32_t load_action_id(size_t index) {
         return kActionLoadBase + static_cast<uint32_t>(index);
+    }
+
+    static uint32_t rename_action_id(size_t index) {
+        return kActionRenameBase + static_cast<uint32_t>(index);
     }
 
     static uint32_t remove_action_id(size_t index) {
         return kActionRemoveBase + static_cast<uint32_t>(index);
     }
 
-    std::vector<PluginParamEnumOption> sound_options() const {
-        std::vector<PluginParamEnumOption> out;
-        out.reserve(sounds_.size());
-        for (size_t i = 0; i < sounds_.size(); ++i) {
-            out.push_back({static_cast<int>(i), sounds_[i].label});
-        }
-        if (out.empty()) {
-            out.push_back({0, "(No Sounds)"});
-        }
-        return out;
-    }
-
     static uint32_t pad_trigger_param_id(uint32_t pad) {
         return kParamBase + (pad * kParamsPerPad);
     }
 
-    static uint32_t pad_sound_param_id(uint32_t pad) {
-        return pad_trigger_param_id(pad) + 1;
-    }
-
     static uint32_t pad_gain_param_id(uint32_t pad) {
-        return pad_trigger_param_id(pad) + 2;
+        return pad_trigger_param_id(pad) + 1;
     }
 
     static bool param_id_to_pad(uint32_t param_id, uint32_t& pad_out) {
@@ -605,23 +589,10 @@ private:
         }
         const uint32_t rel = param_id - kParamBase;
         pad_out = rel / kParamsPerPad;
-        return pad_out < kPadCount;
+        return static_cast<size_t>(pad_out) < 64;
     }
 
-    static std::string slot_label(size_t idx) {
-        return "Sound " + std::to_string(idx + 1);
-    }
-
-    static std::string file_label_from_path(const std::string& path) {
-        const std::filesystem::path p(path);
-        const std::string stem = p.stem().string();
-        if (stem.empty()) {
-            return p.filename().string();
-        }
-        return stem;
-    }
-
-    bool decode_audio_file(const std::string& path, LoadedSound& out) {
+    bool decode_audio_file(const std::string& path, std::vector<float>& out_samples, uint32_t& out_sample_rate) {
         SF_INFO info{};
         SNDFILE* file = sf_open(path.c_str(), SFM_READ, &info);
         if (!file) {
@@ -642,109 +613,96 @@ private:
             return false;
         }
 
-        out.samples.resize(static_cast<size_t>(read_frames));
+        out_samples.resize(static_cast<size_t>(read_frames));
         for (sf_count_t i = 0; i < read_frames; ++i) {
             float sum = 0.0f;
             for (int ch = 0; ch < info.channels; ++ch) {
                 sum += interleaved[static_cast<size_t>(i) * static_cast<size_t>(info.channels) + static_cast<size_t>(ch)];
             }
-            out.samples[static_cast<size_t>(i)] = sum / static_cast<float>(info.channels);
+            out_samples[static_cast<size_t>(i)] = sum / static_cast<float>(info.channels);
         }
 
-        out.sample_rate = static_cast<uint32_t>(std::max(info.samplerate, 1));
-        out.path = path;
-        out.label = file_label_from_path(path);
-        if (out.label.empty()) {
-            out.label = "Loaded Sound";
-        }
+        out_sample_rate = static_cast<uint32_t>(std::max(info.samplerate, 1));
 
         return true;
     }
 
-    void add_sound_slot() {
-        LoadedSound slot;
-        slot.label = slot_label(sounds_.size());
-        slot.sample_rate = 48000;
-        sounds_.push_back(std::move(slot));
+    void add_pad(const std::string& name) {
+        auto pad = std::make_shared<PadRuntime>();
+        pad->name = name;
+        pads_.push_back(std::move(pad));
+        voices_.push_back({});
         ++ui_schema_version_;
     }
 
-    void remove_sound_slot(size_t index) {
-        if (sounds_.size() <= 1 || index >= sounds_.size()) {
+    void remove_pad(size_t index) {
+        if (pads_.size() <= 1 || index >= pads_.size()) {
             return;
         }
 
-        sounds_.erase(sounds_.begin() + static_cast<long>(index));
-
-        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
-            int selected = sound_select_[pad].load(std::memory_order_relaxed);
-            if (selected == static_cast<int>(index)) {
-                selected = std::max(0, selected - 1);
-            } else if (selected > static_cast<int>(index)) {
-                --selected;
-            }
-            selected = std::clamp(selected, 0, static_cast<int>(sounds_.size() - 1));
-            sound_select_[pad].store(selected, std::memory_order_relaxed);
-        }
-
-        for (auto& voice : voices_) {
-            if (!voice.active) {
-                continue;
-            }
-            if (voice.sound_index == index) {
-                voice.active = false;
-            } else if (voice.sound_index > index) {
-                --voice.sound_index;
-            }
-        }
+        pads_.erase(pads_.begin() + static_cast<long>(index));
+        voices_.erase(voices_.begin() + static_cast<long>(index));
 
         ++ui_schema_version_;
     }
 
-    void load_sound_into_slot(size_t index, const std::string& path) {
-        if (index >= sounds_.size() || path.empty()) {
+    void rename_pad(size_t index, const std::string& name) {
+        if (index >= pads_.size()) {
             return;
         }
 
-        LoadedSound loaded;
-        if (!decode_audio_file(path, loaded)) {
+        if (name.empty()) {
             return;
         }
 
-        sounds_[index] = std::move(loaded);
+        pads_[index]->name = name;
         ++ui_schema_version_;
     }
 
-    float render_voice(Voice& v, float) {
+    void load_sound_into_pad(size_t index, const std::string& path, bool keep_name) {
+        if (index >= pads_.size() || path.empty()) {
+            return;
+        }
+
+        std::vector<float> decoded_samples;
+        uint32_t decoded_rate = 48000;
+        if (!decode_audio_file(path, decoded_samples, decoded_rate)) {
+            return;
+        }
+
+        pads_[index]->samples = std::move(decoded_samples);
+        pads_[index]->sample_rate = decoded_rate;
+        pads_[index]->path = path;
+        if (!keep_name && pads_[index]->name.empty()) {
+            pads_[index]->name = "Pad " + std::to_string(index + 1);
+            ++ui_schema_version_;
+        }
+    }
+
+    float render_voice(Voice& v, const PadRuntime& pad) {
         if (!v.active) {
             return 0.0f;
         }
 
-        if (v.sound_index >= sounds_.size()) {
-            v.active = false;
-            return 0.0f;
-        }
-
-        const LoadedSound& sound = sounds_[v.sound_index];
-        if (sound.samples.empty()) {
+        if (pad.samples.empty()) {
             v.active = false;
             return 0.0f;
         }
 
         const size_t i0 = static_cast<size_t>(v.position);
-        if (i0 >= sound.samples.size()) {
+        if (i0 >= pad.samples.size()) {
             v.active = false;
             return 0.0f;
         }
 
-        const size_t i1 = std::min(i0 + 1, sound.samples.size() - 1);
+        const size_t i1 = std::min(i0 + 1, pad.samples.size() - 1);
         const float frac = v.position - static_cast<float>(i0);
-        const float s0 = sound.samples[i0];
-        const float s1 = sound.samples[i1];
+        const float s0 = pad.samples[i0];
+        const float s1 = pad.samples[i1];
         const float sample = s0 + (s1 - s0) * frac;
 
         v.position += std::max(0.0001f, v.step);
-        if (v.position >= static_cast<float>(sound.samples.size())) {
+        if (v.position >= static_cast<float>(pad.samples.size())) {
             v.active = false;
         }
 
@@ -753,12 +711,8 @@ private:
 
     std::atomic<float> master_mix_{0.8f};
     std::atomic<bool> customize_mode_{true};
-    std::array<std::atomic<int>, kPadCount> sound_select_{{0, 0, 0, 0}};
-    std::array<std::atomic<float>, kPadCount> pad_gain_{{0.75f, 0.75f, 0.65f, 0.75f}};
-    std::array<std::atomic<bool>, kPadCount> pad_trigger_{{false, false, false, false}};
-
-    std::vector<LoadedSound> sounds_;
-    std::array<Voice, kPadCount> voices_{};
+    std::vector<std::shared_ptr<PadRuntime>> pads_;
+    std::vector<Voice> voices_;
     uint64_t ui_schema_version_ = 1;
     float last_frame_out_ = 0.0f;
 };

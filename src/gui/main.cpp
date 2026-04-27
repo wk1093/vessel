@@ -54,10 +54,11 @@ struct RackPluginParam {
 
 struct RackPluginCustomControl {
     uint32_t action_id = 0;
-    bool expects_text = false;
+    vessel::CustomControlTextMode text_mode = vessel::CustomControlTextMode::NONE;
     vessel::ParamLayoutHint layout = vessel::ParamLayoutHint::AUTO;
     float ui_width = 0.0f;
     std::string label;
+    std::string text_value;
 };
 
 struct RackPluginInstance {
@@ -380,8 +381,19 @@ void render_plugin_custom_controls(Rack& rack, RackPluginInstance& plugin) {
             ImGui::SetNextItemWidth(control.ui_width);
         }
 
-        if (ImGui::Button(control.label.c_str())) {
-            if (control.expects_text) {
+        if (control.text_mode == vessel::CustomControlTextMode::PLAIN_TEXT) {
+            char text_buf[vessel::kMaxParamNameLen + 1]{};
+            std::strncpy(text_buf, control.text_value.c_str(), vessel::kMaxParamNameLen);
+            text_buf[vessel::kMaxParamNameLen] = '\0';
+            const std::string input_id = std::string("##text_") + std::to_string(control.action_id);
+            ImGui::InputText(input_id.c_str(), text_buf, sizeof(text_buf));
+            control.text_value = text_buf;
+            ImGui::SameLine();
+            if (ImGui::Button(control.label.c_str())) {
+                send_custom_text(rack, plugin, control.action_id, control.text_value);
+            }
+        } else if (ImGui::Button(control.label.c_str())) {
+            if (control.text_mode == vessel::CustomControlTextMode::FILE_PATH) {
                 std::string chosen;
                 if (open_file_picker(false, control.label.c_str(), std::string(), chosen)) {
                     send_custom_text(rack, plugin, control.action_id, chosen);
@@ -610,10 +622,11 @@ void drain_ipc(Rack& rack) {
                     control_ptr = &plugin->custom_controls.back();
                 }
                 control_ptr->action_id = msg->action_id;
-                control_ptr->expects_text = msg->expects_text != 0;
+                control_ptr->text_mode = msg->text_mode;
                 control_ptr->layout = msg->layout;
                 control_ptr->ui_width = msg->ui_width;
                 control_ptr->label = msg->label;
+                control_ptr->text_value = msg->text_value;
             }
         }
 

@@ -30,7 +30,8 @@ struct PluginParamSpec {
 struct PluginCustomControlSpec {
     uint32_t action_id;
     std::string label;
-    bool expects_text{false};
+    std::string text_value;
+    vessel::CustomControlTextMode text_mode{vessel::CustomControlTextMode::NONE};
     vessel::ParamLayoutHint layout{vessel::ParamLayoutHint::AUTO};
     float ui_width{0.0f};
 };

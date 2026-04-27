@@ -615,11 +615,13 @@ void send_plugin_custom_controls(int client_fd, uint32_t instance_id, RackPlugin
         vessel::MsgPluginCustomControl msg;
         msg.instance_id = instance_id;
         msg.action_id = controls[i].action_id;
-        msg.expects_text = controls[i].expects_text ? 1 : 0;
+        msg.text_mode = controls[i].text_mode;
         msg.layout = controls[i].layout;
         msg.ui_width = controls[i].ui_width;
         std::strncpy(msg.label, controls[i].label.c_str(), vessel::kMaxParamNameLen);
         msg.label[vessel::kMaxParamNameLen] = '\0';
+        std::strncpy(msg.text_value, controls[i].text_value.c_str(), vessel::kMaxParamNameLen);
+        msg.text_value[vessel::kMaxParamNameLen] = '\0';
         msg.is_last = (i + 1 == controls.size()) ? 1 : 0;
         send_ipc(client_fd, msg);
     }
@@ -1041,6 +1043,10 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                 for (const auto& param : params) {
                     instance->plugin->set_param(param.first, param.second);
                 }
+                refresh_plugin_param_cache(*instance);
+                send_plugin_params_reset(client_fd, msg->instance_id);
+                send_plugin_params(client_fd, msg->instance_id, *instance->plugin);
+                send_plugin_custom_controls(client_fd, msg->instance_id, *instance->plugin);
             }
             pw_thread_loop_unlock(thread_loop);
         }

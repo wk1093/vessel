@@ -66,6 +66,12 @@ enum class ParamLayoutHint : uint8_t {
     SAME_LINE = 1,
 };
 
+enum class CustomControlTextMode : uint8_t {
+    NONE = 0,
+    FILE_PATH = 1,
+    PLAIN_TEXT = 2,
+};
+
 enum ParamFlags : uint8_t {
     PARAM_FLAG_NONE = 0,
     PARAM_FLAG_LOGARITHMIC = 1u << 0,
@@ -224,10 +230,11 @@ struct __attribute__((packed)) MsgPluginCustomControl {
     MsgHeader hdr{MsgType::PLUGIN_CUSTOM_CONTROL, sizeof(MsgPluginCustomControl)};
     uint32_t instance_id{0};
     uint32_t action_id{0};
-    uint8_t expects_text{0};
+    CustomControlTextMode text_mode{CustomControlTextMode::NONE};
     ParamLayoutHint layout{ParamLayoutHint::AUTO};
     float ui_width{0.0f};
     char label[kMaxParamNameLen + 1]{};
+    char text_value[kMaxParamNameLen + 1]{};
     uint8_t is_last{0};
 };
 
