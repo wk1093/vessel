@@ -169,6 +169,9 @@ void signal_handler(int) {
     g_running.store(false);
 }
 
+const RunnerRack::NodeInfo* find_node_by_id(const RunnerRack& rack, uint32_t node_id);
+const RunnerRack::PortInfo* find_port_by_id(const RunnerRack& rack, uint32_t port_id);
+
 const char* route_mode_to_media_class(vessel::RackRouteMode mode) {
     switch (mode) {
         case vessel::RackRouteMode::SINK:
@@ -192,6 +195,30 @@ std::string route_mode_to_node_name(uint32_t rack_id, vessel::RackRouteMode mode
         default:
             return base;
     }
+}
+
+const char* route_mode_label(vessel::RackRouteMode mode) {
+    switch (mode) {
+        case vessel::RackRouteMode::SINK:
+            return "SINK";
+        case vessel::RackRouteMode::SOURCE:
+            return "SOURCE";
+        case vessel::RackRouteMode::FILTER:
+        default:
+            return "FILTER";
+    }
+}
+
+std::string node_name_or_id(const RunnerRack& rack, uint32_t node_id) {
+    const RunnerRack::NodeInfo* node = find_node_by_id(rack, node_id);
+    if (!node || node->name.empty()) {
+        return std::string("#") + std::to_string(node_id);
+    }
+    return node->name + "(#" + std::to_string(node_id) + ")";
+}
+
+bool is_vessel_node_name(const std::string& name) {
+    return name.rfind("vessel-rack-", 0) == 0;
 }
 
 bool parse_u32(const std::string& text, uint32_t& out_value) {
@@ -283,19 +310,6 @@ bool parse_default_metadata_value(const char* value, std::string& out_name, uint
     return !out_name.empty() || out_id != PW_ID_ANY;
 }
 
-bool starts_with(const std::string& text, const char* prefix) {
-    const std::string p = prefix ? prefix : "";
-    return text.rfind(p, 0) == 0;
-}
-
-bool is_stream_output_node(const RunnerRack::NodeInfo& node) {
-    return starts_with(node.media_class, "Stream/Output/Audio");
-}
-
-bool is_stream_input_node(const RunnerRack::NodeInfo& node) {
-    return starts_with(node.media_class, "Stream/Input/Audio");
-}
-
 std::vector<RunnerRack::PortInfo> collect_ports_for_node(
     const RunnerRack& rack,
     uint32_t node_id,
@@ -368,6 +382,7 @@ void ensure_link_locked(RunnerRack& rack, uint32_t output_port_id, uint32_t inpu
     const RunnerRack::PortInfo* output_port = find_port_by_id(rack, output_port_id);
     const RunnerRack::PortInfo* input_port = find_port_by_id(rack, input_port_id);
     if (!output_port || !input_port) {
+        runner_log("[routing] ensure_link skip unknown ports out=%u in=%u", output_port_id, input_port_id);
         return;
     }
 
@@ -386,6 +401,7 @@ void ensure_link_locked(RunnerRack& rack, uint32_t output_port_id, uint32_t inpu
         nullptr);
 
     if (!props) {
+        runner_log("[routing] ensure_link failed alloc props out=%u in=%u", output_port_id, input_port_id);
         return;
     }
 
@@ -399,6 +415,19 @@ void ensure_link_locked(RunnerRack& rack, uint32_t output_port_id, uint32_t inpu
             0));
     if (proxy) {
         rack.created_link_proxies.push_back(proxy);
+        runner_log(
+            "[routing] ensure_link created %s:%u -> %s:%u",
+            node_name_or_id(rack, output_port->node_id).c_str(),
+            output_port_id,
+            node_name_or_id(rack, input_port->node_id).c_str(),
+            input_port_id);
+    } else {
+        runner_log(
+            "[routing] ensure_link create failed %s:%u -> %s:%u",
+            node_name_or_id(rack, output_port->node_id).c_str(),
+            output_port_id,
+            node_name_or_id(rack, input_port->node_id).c_str(),
+            input_port_id);
     }
     pw_properties_free(props);
 }
@@ -407,21 +436,28 @@ void destroy_link_locked(RunnerRack& rack, uint32_t link_id) {
     if (!rack.registry || link_id == PW_ID_ANY) {
         return;
     }
+    runner_log("[routing] destroy_link id=%u", link_id);
     pw_registry_destroy(rack.registry, link_id);
 }
 
 uint32_t resolve_default_node_id(const RunnerRack& rack, bool sink_mode) {
-    const uint32_t direct_id = sink_mode ? rack.default_sink_id : rack.default_source_id;
-    if (direct_id != PW_ID_ANY && rack.nodes.find(direct_id) != rack.nodes.end()) {
-        return direct_id;
-    }
-
     const std::string& name = sink_mode ? rack.default_sink_name : rack.default_source_name;
+    const char* expected_class = sink_mode ? "Audio/Sink" : "Audio/Source";
+
+    // Prefer name first because metadata id can be stale/reused when nodes restart.
     if (!name.empty()) {
         for (const auto& kv : rack.nodes) {
-            if (kv.second.name == name) {
+            if (kv.second.name == name && kv.second.media_class == expected_class) {
                 return kv.second.id;
             }
+        }
+    }
+
+    const uint32_t direct_id = sink_mode ? rack.default_sink_id : rack.default_source_id;
+    if (direct_id != PW_ID_ANY) {
+        const auto it = rack.nodes.find(direct_id);
+        if (it != rack.nodes.end() && it->second.media_class == expected_class) {
+            return direct_id;
         }
     }
 
@@ -464,7 +500,9 @@ bool set_default_node_metadata_locked(RunnerRack& rack, bool sink_mode, uint32_t
 
     const std::string key = sink_mode ? "default.audio.sink" : "default.audio.source";
     const std::string value = std::string("{\"name\":\"") + node->name + "\",\"id\":" + std::to_string(node->id) + "}";
-    return pw_metadata_set_property(rack.metadata, 0, key.c_str(), "Spa:String:JSON", value.c_str()) == 0;
+    const int rc = pw_metadata_set_property(rack.metadata, 0, key.c_str(), "Spa:String:JSON", value.c_str());
+    runner_log("[routing] set metadata %s -> %s rc=%d", key.c_str(), value.c_str(), rc);
+    return rc == 0;
 }
 
 void remember_intercept_target_locked(RunnerRack& rack, bool sink_mode, uint32_t node_id) {
@@ -482,6 +520,29 @@ void remember_intercept_target_locked(RunnerRack& rack, bool sink_mode, uint32_t
     }
 }
 
+void pin_stream_target_locked(RunnerRack& rack, uint32_t stream_node_id, uint32_t target_node_id) {
+    if (!rack.metadata || stream_node_id == PW_ID_ANY || target_node_id == PW_ID_ANY) {
+        return;
+    }
+
+    const RunnerRack::NodeInfo* target_node = find_node_by_id(rack, target_node_id);
+    if (!target_node || target_node->name.empty()) {
+        return;
+    }
+
+    const int rc = pw_metadata_set_property(
+        rack.metadata,
+        stream_node_id,
+        "target.object",
+        "Spa:String",
+        target_node->name.c_str());
+    runner_log(
+        "[routing] pin stream node=%u target.object=%s rc=%d",
+        stream_node_id,
+        target_node->name.c_str(),
+        rc);
+}
+
 void maintain_default_routing_policy_locked(RunnerRack& rack) {
     const uint32_t rack_node_id = resolve_rack_node_id(rack);
     if (rack_node_id == PW_ID_ANY) {
@@ -494,10 +555,19 @@ void maintain_default_routing_policy_locked(RunnerRack& rack) {
     const uint32_t observed_sink_id = resolve_default_node_id(rack, true);
     const uint32_t observed_source_id = resolve_default_node_id(rack, false);
 
+    runner_log(
+        "[routing] policy mode=%s wantSink=%d wantSource=%d observedSink=%s observedSource=%s",
+        route_mode_label(rack.route_mode),
+        want_sink_ownership ? 1 : 0,
+        want_source_ownership ? 1 : 0,
+        node_name_or_id(rack, observed_sink_id).c_str(),
+        node_name_or_id(rack, observed_source_id).c_str());
+
     if (want_sink_ownership) {
         rack.owns_default_sink = true;
         if (observed_sink_id != PW_ID_ANY && observed_sink_id != rack_node_id) {
             remember_intercept_target_locked(rack, true, observed_sink_id);
+            runner_log("[routing] remember sink target=%s", node_name_or_id(rack, observed_sink_id).c_str());
         }
         if (observed_sink_id != rack_node_id) {
             set_default_node_metadata_locked(rack, true, rack_node_id);
@@ -506,6 +576,7 @@ void maintain_default_routing_policy_locked(RunnerRack& rack) {
         const uint32_t restore_sink_id = resolve_node_id_by_ref(rack, rack.intercepted_sink_name, rack.intercepted_sink_id);
         if (restore_sink_id != PW_ID_ANY) {
             set_default_node_metadata_locked(rack, true, restore_sink_id);
+            runner_log("[routing] restore default sink=%s", node_name_or_id(rack, restore_sink_id).c_str());
         }
         rack.owns_default_sink = false;
     }
@@ -514,6 +585,7 @@ void maintain_default_routing_policy_locked(RunnerRack& rack) {
         rack.owns_default_source = true;
         if (observed_source_id != PW_ID_ANY && observed_source_id != rack_node_id) {
             remember_intercept_target_locked(rack, false, observed_source_id);
+            runner_log("[routing] remember source target=%s", node_name_or_id(rack, observed_source_id).c_str());
         }
         if (observed_source_id != rack_node_id) {
             set_default_node_metadata_locked(rack, false, rack_node_id);
@@ -522,6 +594,7 @@ void maintain_default_routing_policy_locked(RunnerRack& rack) {
         const uint32_t restore_source_id = resolve_node_id_by_ref(rack, rack.intercepted_source_name, rack.intercepted_source_id);
         if (restore_source_id != PW_ID_ANY) {
             set_default_node_metadata_locked(rack, false, restore_source_id);
+            runner_log("[routing] restore default source=%s", node_name_or_id(rack, restore_source_id).c_str());
         }
         rack.owns_default_source = false;
     }
@@ -542,6 +615,38 @@ uint32_t resolve_intercept_target_node_id(const RunnerRack& rack, bool sink_mode
     return resolve_default_node_id(rack, sink_mode);
 }
 
+uint32_t resolve_physical_device_node_fallback(const RunnerRack& rack, bool sink_mode, uint32_t rack_node_id) {
+    const char* wanted_class = sink_mode ? "Audio/Sink" : "Audio/Source";
+    uint32_t fallback_any = PW_ID_ANY;
+    for (const auto& kv : rack.nodes) {
+        const RunnerRack::NodeInfo& node = kv.second;
+        if (node.id == rack_node_id) {
+            continue;
+        }
+        if (node.media_class != wanted_class) {
+            continue;
+        }
+        if (is_vessel_node_name(node.name)) {
+            continue;
+        }
+
+        if (!sink_mode) {
+            const bool looks_like_monitor = node.name.find("monitor") != std::string::npos
+                || node.name.find("Monitor") != std::string::npos;
+            if (!looks_like_monitor) {
+                return node.id;
+            }
+            if (fallback_any == PW_ID_ANY) {
+                fallback_any = node.id;
+            }
+            continue;
+        }
+
+        return node.id;
+    }
+    return fallback_any;
+}
+
 uint32_t pick_target_port_by_channel(
     const std::vector<RunnerRack::PortInfo>& candidates,
     const std::string& preferred_channel,
@@ -556,10 +661,37 @@ uint32_t pick_target_port_by_channel(
                 return port.id;
             }
         }
+
+        // If channel labels differ between devices (AUX0/AUX1 vs FL/FR, etc.),
+        // fall back to stable port ordering.
+        if (fallback_index < candidates.size()) {
+            return candidates[fallback_index].id;
+        }
+        if (candidates.size() == 1) {
+            return candidates.front().id;
+        }
+        return candidates.front().id;
+    }
+
+    // For ports without a channel label, avoid ambiguous fallback on multi-channel nodes.
+    if (candidates.size() == 1) {
+        return candidates.front().id;
     }
 
     const size_t index = std::min(fallback_index, candidates.size() - 1);
-    return candidates[index].id;
+    if (index < candidates.size()) {
+        return candidates[index].id;
+    }
+    return PW_ID_ANY;
+}
+
+size_t find_port_index_in_list(const std::vector<RunnerRack::PortInfo>& ports, uint32_t port_id) {
+    for (size_t i = 0; i < ports.size(); ++i) {
+        if (ports[i].id == port_id) {
+            return i;
+        }
+    }
+    return 0;
 }
 
 void apply_auto_routing_locked(RunnerRack& rack) {
@@ -575,12 +707,37 @@ void apply_auto_routing_locked(RunnerRack& rack) {
 
     maintain_default_routing_policy_locked(rack);
 
+    const bool sink_mode = rack.route_mode == vessel::RackRouteMode::SINK;
     const uint32_t rack_node_id = resolve_rack_node_id(rack);
-    const uint32_t default_node_id = resolve_intercept_target_node_id(rack, rack.route_mode == vessel::RackRouteMode::SINK);
+    uint32_t default_node_id = resolve_intercept_target_node_id(rack, sink_mode);
+    if (default_node_id == PW_ID_ANY || default_node_id == rack_node_id) {
+        const uint32_t fallback_id = resolve_physical_device_node_fallback(rack, sink_mode, rack_node_id);
+        if (fallback_id != PW_ID_ANY) {
+            default_node_id = fallback_id;
+            remember_intercept_target_locked(rack, sink_mode, fallback_id);
+            runner_log(
+                "[routing] fallback physical %s target=%s",
+                sink_mode ? "sink" : "source",
+                node_name_or_id(rack, fallback_id).c_str());
+        }
+    }
+
+    runner_log(
+        "[routing] apply mode=%s auto=%d rack=%s target=%s nodes=%zu ports=%zu links=%zu",
+        route_mode_label(rack.route_mode),
+        rack.auto_route_default ? 1 : 0,
+        node_name_or_id(rack, rack_node_id).c_str(),
+        node_name_or_id(rack, default_node_id).c_str(),
+        rack.nodes.size(),
+        rack.ports.size(),
+        rack.links.size());
+
     if (rack_node_id == PW_ID_ANY || default_node_id == PW_ID_ANY) {
+        runner_log("[routing] skip apply: rack or target missing");
         return;
     }
     if (default_node_id == rack_node_id) {
+        runner_log("[routing] skip apply: target resolved to rack node");
         return;
     }
 
@@ -603,13 +760,19 @@ void apply_auto_routing_locked(RunnerRack& rack) {
             if (in_port->node_id != default_node_id) {
                 continue;
             }
-            const RunnerRack::NodeInfo* out_node = find_node_by_id(rack, out_port->node_id);
-            if (!out_node || !is_stream_output_node(*out_node)) {
+            if (out_port->node_id == rack_node_id || out_port->node_id == default_node_id) {
                 continue;
             }
 
-            const uint32_t rack_input_port = pick_target_port_by_channel(rack_inputs, in_port->channel, 0);
+            const size_t fallback_index = find_port_index_in_list(default_inputs, in_port->id);
+            const uint32_t rack_input_port = pick_target_port_by_channel(rack_inputs, in_port->channel, fallback_index);
             if (rack_input_port != PW_ID_ANY) {
+                runner_log(
+                    "[routing] sink reroute app->rack outPort=%u inPort=%u oldLink=%u",
+                    out_port->id,
+                    rack_input_port,
+                    link.id);
+                pin_stream_target_locked(rack, out_port->node_id, rack_node_id);
                 ensure_link_locked(rack, out_port->id, rack_input_port);
                 links_to_remove.push_back(link.id);
             }
@@ -622,6 +785,10 @@ void apply_auto_routing_locked(RunnerRack& rack) {
         for (size_t i = 0; i < rack_outputs.size(); ++i) {
             const uint32_t sink_in_port = pick_target_port_by_channel(default_inputs, rack_outputs[i].channel, i);
             if (sink_in_port != PW_ID_ANY) {
+                runner_log(
+                    "[routing] sink ensure rack->device outPort=%u inPort=%u",
+                    rack_outputs[i].id,
+                    sink_in_port);
                 ensure_link_locked(rack, rack_outputs[i].id, sink_in_port);
             }
         }
@@ -639,13 +806,19 @@ void apply_auto_routing_locked(RunnerRack& rack) {
             if (out_port->node_id != default_node_id) {
                 continue;
             }
-            const RunnerRack::NodeInfo* in_node = find_node_by_id(rack, in_port->node_id);
-            if (!in_node || !is_stream_input_node(*in_node)) {
+            if (in_port->node_id == rack_node_id || in_port->node_id == default_node_id) {
                 continue;
             }
 
-            const uint32_t rack_output_port = pick_target_port_by_channel(rack_outputs, out_port->channel, 0);
+            const size_t fallback_index = find_port_index_in_list(default_outputs, out_port->id);
+            const uint32_t rack_output_port = pick_target_port_by_channel(rack_outputs, out_port->channel, fallback_index);
             if (rack_output_port != PW_ID_ANY) {
+                runner_log(
+                    "[routing] source reroute rack->app outPort=%u inPort=%u oldLink=%u",
+                    rack_output_port,
+                    in_port->id,
+                    link.id);
+                pin_stream_target_locked(rack, in_port->node_id, rack_node_id);
                 ensure_link_locked(rack, rack_output_port, in_port->id);
                 links_to_remove.push_back(link.id);
             }
@@ -658,6 +831,10 @@ void apply_auto_routing_locked(RunnerRack& rack) {
         for (size_t i = 0; i < default_outputs.size(); ++i) {
             const uint32_t rack_in_port = pick_target_port_by_channel(rack_inputs, default_outputs[i].channel, i);
             if (rack_in_port != PW_ID_ANY) {
+                runner_log(
+                    "[routing] source ensure device->rack outPort=%u inPort=%u",
+                    default_outputs[i].id,
+                    rack_in_port);
                 ensure_link_locked(rack, default_outputs[i].id, rack_in_port);
             }
         }
@@ -1234,6 +1411,8 @@ void bind_default_metadata_locked(RunnerRack& rack, uint32_t id, uint32_t versio
             if (!rack || !key) {
                 return 0;
             }
+
+            runner_log("[routing] metadata update key=%s value=%s", key, value ? value : "(null)");
 
             if (std::strcmp(key, "default.audio.sink") == 0) {
                 parse_default_metadata_value(value, rack->default_sink_name, rack->default_sink_id);
