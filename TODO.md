@@ -1,4 +1,6 @@
 - [x] Add support for different types of LV2 arguments (e.g. float, int, bool, enum, logarithmic, etc.)
+- [x] Make the "open gui" button change to "close gui" when the plugin's GUI is open.
+- [x] Make it so when parameters are changed in the plugin's GUI, the changes are reflected in the host's parameter list. (already works for the other way around, but not from the plugin gui to the host)
 - [ ] Add support for more plugin GUI elements for custom plugins (e.g. knobs, buttons, file selectors, etc.)
 - [ ] Create customizable soundboard plugin.
 - [ ] Add LV2 ui inside of an imgui window instead of a separate window.

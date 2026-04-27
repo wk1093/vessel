@@ -31,6 +31,8 @@ public:
 
     virtual bool has_custom_ui() const { return false; }
     virtual bool open_custom_ui() { return false; }
+    virtual void close_custom_ui() {}
+    virtual bool is_custom_ui_open() const { return false; }
     virtual void pump_ui() {}
 };
 

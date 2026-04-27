@@ -286,6 +286,13 @@ void drain_ipc(Rack& rack) {
                 plugin.has_custom_ui = msg->has_custom_ui != 0;
                 rack.plugins.push_back(std::move(plugin));
             }
+        } else if (hdr->type == vessel::MsgType::PLUGIN_UI_STATE
+                   && frame_size == sizeof(vessel::MsgPluginUiState)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgPluginUiState*>(frame);
+            RackPluginInstance* plugin = find_plugin_instance(rack, msg->instance_id);
+            if (plugin) {
+                plugin->is_open = msg->is_open != 0;
+            }
         } else if (hdr->type == vessel::MsgType::PLUGIN_PARAM_DESC
                    && frame_size == sizeof(vessel::MsgPluginParamDesc)) {
             const auto* msg = reinterpret_cast<const vessel::MsgPluginParamDesc*>(frame);
@@ -591,7 +598,8 @@ int main(int, char* argv[]) {
 
                 const float remove_button_width = ImGui::GetFrameHeight();
                 const float button_spacing = ImGui::GetStyle().ItemSpacing.x;
-                const float open_button_width = plugin.has_custom_ui ? ImGui::CalcTextSize("Open GUI").x + ImGui::GetStyle().FramePadding.x * 2.0f : 0.0f;
+                const char* ui_button_label = plugin.is_open ? "Close GUI" : "Open GUI";
+                const float open_button_width = plugin.has_custom_ui ? ImGui::CalcTextSize(ui_button_label).x + ImGui::GetStyle().FramePadding.x * 2.0f : 0.0f;
                 const float right_edge = ImGui::GetWindowContentRegionMax().x;
 
                 if (plugin.has_custom_ui) {
@@ -599,7 +607,7 @@ int main(int, char* argv[]) {
                     ImGui::SameLine();
                     ImGui::SetCursorPosX(open_button_x);
                     ImGui::SetNextItemAllowOverlap();
-                    if (ImGui::Button("Open GUI")) {
+                    if (ImGui::Button(ui_button_label)) {
                         vessel::MsgOpenPluginUi msg;
                         msg.instance_id = plugin.instance_id;
                         send_ipc(rack, msg);

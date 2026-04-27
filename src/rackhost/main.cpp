@@ -38,6 +38,9 @@ struct PluginInstance {
     uint32_t instance_id = 0;
     bool bypassed = false;
     std::unique_ptr<RackPlugin> plugin;
+    bool custom_ui_open = false;
+    std::vector<PluginParamSpec> param_specs;
+    std::vector<float> last_param_values;
 };
 
 struct RunnerRack {
@@ -130,6 +133,55 @@ void send_ipc(int client_fd, const T& msg) {
     }
 }
 
+void send_plugin_ui_state(int client_fd, uint32_t instance_id, bool is_open) {
+    vessel::MsgPluginUiState msg;
+    msg.instance_id = instance_id;
+    msg.is_open = is_open ? 1 : 0;
+    send_ipc(client_fd, msg);
+}
+
+void send_plugin_param_desc_value(int client_fd, uint32_t instance_id, const PluginParamSpec& spec, float value, uint8_t is_last) {
+    vessel::MsgPluginParamDesc msg;
+    msg.instance_id = instance_id;
+    msg.param_id = spec.id;
+    msg.widget = spec.widget;
+    msg.value_type = spec.value_type;
+    msg.flags = spec.flags;
+    msg.min_value = spec.min_value;
+    msg.max_value = spec.max_value;
+    msg.value = value;
+    std::strncpy(msg.name, spec.name, vessel::kMaxParamNameLen);
+    msg.name[vessel::kMaxParamNameLen] = '\0';
+    msg.is_last = is_last;
+    send_ipc(client_fd, msg);
+}
+
+void refresh_plugin_param_cache(PluginInstance& instance) {
+    instance.param_specs = instance.plugin->param_specs();
+    instance.last_param_values.clear();
+    instance.last_param_values.reserve(instance.param_specs.size());
+    for (const auto& spec : instance.param_specs) {
+        instance.last_param_values.push_back(instance.plugin->get_param(spec.id));
+    }
+}
+
+void flush_plugin_param_changes(int client_fd, PluginInstance& instance) {
+    if (instance.param_specs.empty()) {
+        return;
+    }
+    if (instance.last_param_values.size() != instance.param_specs.size()) {
+        refresh_plugin_param_cache(instance);
+    }
+
+    for (size_t i = 0; i < instance.param_specs.size(); ++i) {
+        const float value = instance.plugin->get_param(instance.param_specs[i].id);
+        if (std::fabs(value - instance.last_param_values[i]) > 1e-6f) {
+            instance.last_param_values[i] = value;
+            send_plugin_param_desc_value(client_fd, instance.instance_id, instance.param_specs[i], value, 1);
+        }
+    }
+}
+
 void send_plugin_catalog(int client_fd) {
     std::vector<const vessel::PluginManifestEntry*> supported;
     supported.reserve(vessel::kDefaultPluginCount);
@@ -165,20 +217,8 @@ void send_lv2_catalog(const RunnerRack& rack, int client_fd) {
 void send_plugin_params(int client_fd, uint32_t instance_id, RackPlugin& plugin) {
     const std::vector<PluginParamSpec> specs = plugin.param_specs();
     for (size_t i = 0; i < specs.size(); ++i) {
-        const PluginParamSpec& spec = specs[i];
-        vessel::MsgPluginParamDesc msg;
-        msg.instance_id = instance_id;
-        msg.param_id = spec.id;
-        msg.widget = spec.widget;
-        msg.value_type = spec.value_type;
-        msg.flags = spec.flags;
-        msg.min_value = spec.min_value;
-        msg.max_value = spec.max_value;
-        msg.value = plugin.get_param(spec.id);
-        std::strncpy(msg.name, spec.name, vessel::kMaxParamNameLen);
-        msg.name[vessel::kMaxParamNameLen] = '\0';
-        msg.is_last = (i + 1 == specs.size()) ? 1 : 0;
-        send_ipc(client_fd, msg);
+        const float value = plugin.get_param(specs[i].id);
+        send_plugin_param_desc_value(client_fd, instance_id, specs[i], value, (i + 1 == specs.size()) ? 1 : 0);
     }
 }
 
@@ -396,9 +436,15 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                 const char* display_name = plugin->display_name();
 
                 pw_thread_loop_lock(thread_loop);
-                rack.plugins.push_back({instance_id, false, std::move(plugin)});
-                RackPlugin* added = find_plugin(rack, instance_id);
-                if (added) {
+                PluginInstance new_instance;
+                new_instance.instance_id = instance_id;
+                new_instance.bypassed = false;
+                new_instance.plugin = std::move(plugin);
+                rack.plugins.push_back(std::move(new_instance));
+                PluginInstance* added_instance = find_plugin_instance(rack, instance_id);
+                if (added_instance && added_instance->plugin) {
+                    RackPlugin* added = added_instance->plugin.get();
+                    refresh_plugin_param_cache(*added_instance);
                     vessel::MsgPluginInstanceAdded added_msg;
                     added_msg.instance_id = instance_id;
                     added_msg.plugin_type_id = type_id;
@@ -406,6 +452,7 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                     added_msg.name[vessel::kMaxPluginNameLen] = '\0';
                     added_msg.has_custom_ui = added->has_custom_ui() ? 1 : 0;
                     send_ipc(client_fd, added_msg);
+                    send_plugin_ui_state(client_fd, instance_id, false);
                     send_plugin_params(client_fd, instance_id, *added);
                 }
                 pw_thread_loop_unlock(thread_loop);
@@ -452,9 +499,16 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
         } else if (hdr->type == vessel::MsgType::OPEN_PLUGIN_UI && frame_size == sizeof(vessel::MsgOpenPluginUi)) {
             const auto* msg = reinterpret_cast<const vessel::MsgOpenPluginUi*>(frame);
             pw_thread_loop_lock(thread_loop);
-            RackPlugin* plugin = find_plugin(rack, msg->instance_id);
-            if (plugin && plugin->has_custom_ui()) {
-                plugin->open_custom_ui();
+            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+            if (instance && instance->plugin && instance->plugin->has_custom_ui()) {
+                if (instance->plugin->is_custom_ui_open()) {
+                    instance->plugin->close_custom_ui();
+                } else {
+                    instance->plugin->open_custom_ui();
+                }
+                const bool is_open = instance->plugin->is_custom_ui_open();
+                instance->custom_ui_open = is_open;
+                send_plugin_ui_state(client_fd, msg->instance_id, is_open);
             }
             pw_thread_loop_unlock(thread_loop);
         }
@@ -561,6 +615,14 @@ int main(int argc, char* argv[]) {
 
         for (auto& instance : rack.plugins) {
             instance.plugin->pump_ui();
+
+            const bool ui_is_open = instance.plugin->is_custom_ui_open();
+            if (ui_is_open != instance.custom_ui_open) {
+                instance.custom_ui_open = ui_is_open;
+                send_plugin_ui_state(client_fd, instance.instance_id, ui_is_open);
+            }
+
+            flush_plugin_param_changes(client_fd, instance);
         }
 
         const auto now = std::chrono::steady_clock::now();

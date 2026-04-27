@@ -467,10 +467,21 @@ public:
         }
 
         if (ui_show_iface_ && ui_show_iface_->show) {
-            return ui_show_iface_->show(suil_instance_get_handle(ui_instance_)) == 0;
+            const bool opened = ui_show_iface_->show(suil_instance_get_handle(ui_instance_)) == 0;
+            ui_open_ = opened;
+            return opened;
         }
 
-        return false;
+        ui_open_ = ui_instance_ != nullptr;
+        return ui_open_;
+    }
+
+    void close_custom_ui() override {
+        close_custom_ui_impl();
+    }
+
+    bool is_custom_ui_open() const override {
+        return ui_open_;
     }
 
     void pump_ui() override {
@@ -478,7 +489,7 @@ public:
             return;
         }
         if (ui_idle_iface_->idle(suil_instance_get_handle(ui_instance_)) != 0) {
-            close_custom_ui();
+            close_custom_ui_impl();
         }
     }
 
@@ -499,7 +510,7 @@ private:
         }
     }
 
-    void close_custom_ui() {
+    void close_custom_ui_impl() {
         if (ui_instance_) {
             if (ui_show_iface_ && ui_show_iface_->hide) {
                 ui_show_iface_->hide(suil_instance_get_handle(ui_instance_));
@@ -507,6 +518,7 @@ private:
             suil_instance_free(ui_instance_);
             ui_instance_ = nullptr;
         }
+        ui_open_ = false;
         ui_idle_iface_ = nullptr;
         ui_show_iface_ = nullptr;
         if (ui_host_) {
@@ -606,6 +618,7 @@ private:
     SuilInstance* ui_instance_ = nullptr;
     const LV2UI_Idle_Interface* ui_idle_iface_ = nullptr;
     const LV2UI_Show_Interface* ui_show_iface_ = nullptr;
+    bool ui_open_ = false;
 
     uint32_t audio_in_port_ = std::numeric_limits<uint32_t>::max();
     uint32_t audio_out_port_ = std::numeric_limits<uint32_t>::max();
