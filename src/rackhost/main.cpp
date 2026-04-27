@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
@@ -15,13 +17,17 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
 
+#include <spa/utils/dict.h>
 #include <pipewire/filter.h>
+#include <pipewire/extensions/metadata.h>
+#include <pipewire/link.h>
 #include <pipewire/pipewire.h>
 #include <suil/suil.h>
 
@@ -65,6 +71,49 @@ struct SavedRackState {
 };
 
 struct RunnerRack {
+    struct NodeInfo {
+        uint32_t id = PW_ID_ANY;
+        std::string name;
+        std::string media_class;
+    };
+
+    struct PortInfo {
+        uint32_t id = PW_ID_ANY;
+        uint32_t node_id = PW_ID_ANY;
+        std::string direction;
+        std::string channel;
+        std::string name;
+    };
+
+    struct LinkInfo {
+        uint32_t id = PW_ID_ANY;
+        uint32_t output_port_id = PW_ID_ANY;
+        uint32_t input_port_id = PW_ID_ANY;
+    };
+
+    uint32_t rack_id = 0;
+    vessel::RackRouteMode route_mode = vessel::RackRouteMode::FILTER;
+    bool auto_route_default = false;
+
+    struct pw_context* context = nullptr;
+    struct pw_core* core = nullptr;
+    struct pw_registry* registry = nullptr;
+    struct pw_metadata* metadata = nullptr;
+    uint32_t metadata_global_id = PW_ID_ANY;
+    struct spa_hook core_listener {};
+    struct spa_hook registry_listener {};
+    struct spa_hook metadata_listener {};
+
+    std::unordered_map<uint32_t, NodeInfo> nodes;
+    std::unordered_map<uint32_t, PortInfo> ports;
+    std::unordered_map<uint32_t, LinkInfo> links;
+    std::vector<struct pw_proxy*> created_link_proxies;
+    std::string default_sink_name;
+    std::string default_source_name;
+    uint32_t default_sink_id = PW_ID_ANY;
+    uint32_t default_source_id = PW_ID_ANY;
+    bool routing_in_progress = false;
+
     struct pw_filter* filter = nullptr;
     void* input_ports[2] = {nullptr, nullptr};
     void* output_ports[2] = {nullptr, nullptr};
@@ -78,15 +127,428 @@ struct RunnerRack {
     std::vector<uint8_t> rx_buffer;
 
     ~RunnerRack() {
+        if (metadata != nullptr) {
+            spa_hook_remove(&metadata_listener);
+            metadata = nullptr;
+        }
+        if (registry != nullptr) {
+            spa_hook_remove(&registry_listener);
+            registry = nullptr;
+        }
+        if (core != nullptr) {
+            spa_hook_remove(&core_listener);
+            core = nullptr;
+        }
+
         if (filter != nullptr) {
             pw_filter_destroy(filter);
             filter = nullptr;
+        }
+
+        for (struct pw_proxy* proxy : created_link_proxies) {
+            if (proxy != nullptr) {
+                pw_proxy_destroy(proxy);
+            }
+        }
+        created_link_proxies.clear();
+
+        if (context != nullptr) {
+            pw_context_destroy(context);
+            context = nullptr;
         }
     }
 };
 
 void signal_handler(int) {
     g_running.store(false);
+}
+
+const char* route_mode_to_media_class(vessel::RackRouteMode mode) {
+    switch (mode) {
+        case vessel::RackRouteMode::SINK:
+            return "Audio/Sink";
+        case vessel::RackRouteMode::SOURCE:
+            return "Audio/Source";
+        case vessel::RackRouteMode::FILTER:
+        default:
+            return "Audio/Filter";
+    }
+}
+
+std::string route_mode_to_node_name(uint32_t rack_id, vessel::RackRouteMode mode) {
+    const std::string base = "vessel-rack-" + std::to_string(rack_id);
+    switch (mode) {
+        case vessel::RackRouteMode::SINK:
+            return base + "-sink";
+        case vessel::RackRouteMode::SOURCE:
+            return base + "-source";
+        case vessel::RackRouteMode::FILTER:
+        default:
+            return base;
+    }
+}
+
+bool parse_u32(const std::string& text, uint32_t& out_value) {
+    if (text.empty()) {
+        return false;
+    }
+    uint64_t value = 0;
+    for (const char c : text) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            return false;
+        }
+        value = value * 10u + static_cast<uint64_t>(c - '0');
+        if (value > UINT32_MAX) {
+            return false;
+        }
+    }
+    out_value = static_cast<uint32_t>(value);
+    return true;
+}
+
+bool parse_default_metadata_value(const char* value, std::string& out_name, uint32_t& out_id) {
+    out_name.clear();
+    out_id = PW_ID_ANY;
+    if (!value || value[0] == '\0') {
+        return false;
+    }
+
+    const std::string text(value);
+
+    const auto parse_json_string_field = [&](const char* field, std::string& out) -> bool {
+        const std::string key = std::string("\"") + field + "\"";
+        const size_t key_pos = text.find(key);
+        if (key_pos == std::string::npos) {
+            return false;
+        }
+        const size_t colon_pos = text.find(':', key_pos + key.size());
+        if (colon_pos == std::string::npos) {
+            return false;
+        }
+        const size_t quote_start = text.find('"', colon_pos + 1);
+        if (quote_start == std::string::npos) {
+            return false;
+        }
+        const size_t quote_end = text.find('"', quote_start + 1);
+        if (quote_end == std::string::npos || quote_end <= quote_start + 1) {
+            return false;
+        }
+        out = text.substr(quote_start + 1, quote_end - quote_start - 1);
+        return true;
+    };
+
+    std::string parsed_name;
+    parse_json_string_field("name", parsed_name);
+    if (!parsed_name.empty()) {
+        out_name = parsed_name;
+    }
+
+    const std::string id_key = "\"id\"";
+    const size_t id_pos = text.find(id_key);
+    if (id_pos != std::string::npos) {
+        const size_t colon_pos = text.find(':', id_pos + id_key.size());
+        if (colon_pos != std::string::npos) {
+            size_t start = colon_pos + 1;
+            while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start]))) {
+                ++start;
+            }
+            size_t end = start;
+            while (end < text.size() && std::isdigit(static_cast<unsigned char>(text[end]))) {
+                ++end;
+            }
+            if (end > start) {
+                uint32_t parsed_id = PW_ID_ANY;
+                if (parse_u32(text.substr(start, end - start), parsed_id)) {
+                    out_id = parsed_id;
+                }
+            }
+        }
+    }
+
+    if (out_name.empty() && out_id == PW_ID_ANY) {
+        uint32_t raw_id = PW_ID_ANY;
+        if (parse_u32(text, raw_id)) {
+            out_id = raw_id;
+        } else {
+            out_name = text;
+        }
+    }
+
+    return !out_name.empty() || out_id != PW_ID_ANY;
+}
+
+bool starts_with(const std::string& text, const char* prefix) {
+    const std::string p = prefix ? prefix : "";
+    return text.rfind(p, 0) == 0;
+}
+
+bool is_stream_output_node(const RunnerRack::NodeInfo& node) {
+    return starts_with(node.media_class, "Stream/Output/Audio");
+}
+
+bool is_stream_input_node(const RunnerRack::NodeInfo& node) {
+    return starts_with(node.media_class, "Stream/Input/Audio");
+}
+
+std::vector<RunnerRack::PortInfo> collect_ports_for_node(
+    const RunnerRack& rack,
+    uint32_t node_id,
+    const char* direction) {
+    std::vector<RunnerRack::PortInfo> out;
+    out.reserve(4);
+    for (const auto& kv : rack.ports) {
+        const RunnerRack::PortInfo& port = kv.second;
+        if (port.node_id == node_id && port.direction == direction) {
+            out.push_back(port);
+        }
+    }
+
+    std::sort(
+        out.begin(),
+        out.end(),
+        [](const RunnerRack::PortInfo& a, const RunnerRack::PortInfo& b) {
+            auto rank = [](const std::string& channel) -> int {
+                if (channel == "FL") return 0;
+                if (channel == "FR") return 1;
+                if (channel == "MONO") return 2;
+                return 10;
+            };
+            const int ar = rank(a.channel);
+            const int br = rank(b.channel);
+            if (ar != br) return ar < br;
+            return a.id < b.id;
+        });
+
+    return out;
+}
+
+const RunnerRack::PortInfo* find_port_by_id(const RunnerRack& rack, uint32_t port_id) {
+    const auto it = rack.ports.find(port_id);
+    if (it == rack.ports.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+const RunnerRack::NodeInfo* find_node_by_id(const RunnerRack& rack, uint32_t node_id) {
+    const auto it = rack.nodes.find(node_id);
+    if (it == rack.nodes.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+bool link_exists(const RunnerRack& rack, uint32_t output_port_id, uint32_t input_port_id) {
+    for (const auto& kv : rack.links) {
+        const RunnerRack::LinkInfo& link = kv.second;
+        if (link.output_port_id == output_port_id && link.input_port_id == input_port_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ensure_link_locked(RunnerRack& rack, uint32_t output_port_id, uint32_t input_port_id) {
+    if (!rack.core || !rack.registry) {
+        return;
+    }
+    if (output_port_id == PW_ID_ANY || input_port_id == PW_ID_ANY) {
+        return;
+    }
+    if (link_exists(rack, output_port_id, input_port_id)) {
+        return;
+    }
+
+    const RunnerRack::PortInfo* output_port = find_port_by_id(rack, output_port_id);
+    const RunnerRack::PortInfo* input_port = find_port_by_id(rack, input_port_id);
+    if (!output_port || !input_port) {
+        return;
+    }
+
+    const std::string output_node = std::to_string(output_port->node_id);
+    const std::string input_node = std::to_string(input_port->node_id);
+    const std::string output_port_str = std::to_string(output_port_id);
+    const std::string input_port_str = std::to_string(input_port_id);
+
+    struct pw_properties* props = pw_properties_new(
+        PW_KEY_LINK_OUTPUT_NODE, output_node.c_str(),
+        PW_KEY_LINK_INPUT_NODE, input_node.c_str(),
+        PW_KEY_LINK_OUTPUT_PORT, output_port_str.c_str(),
+        PW_KEY_LINK_INPUT_PORT, input_port_str.c_str(),
+        PW_KEY_LINK_PASSIVE, "false",
+        PW_KEY_OBJECT_LINGER, "true",
+        nullptr);
+
+    if (!props) {
+        return;
+    }
+
+    struct pw_proxy* proxy = static_cast<struct pw_proxy*>(
+        pw_core_create_object(
+            rack.core,
+            "link-factory",
+            PW_TYPE_INTERFACE_Link,
+            PW_VERSION_LINK,
+            &props->dict,
+            0));
+    if (proxy) {
+        rack.created_link_proxies.push_back(proxy);
+    }
+    pw_properties_free(props);
+}
+
+void destroy_link_locked(RunnerRack& rack, uint32_t link_id) {
+    if (!rack.registry || link_id == PW_ID_ANY) {
+        return;
+    }
+    pw_registry_destroy(rack.registry, link_id);
+}
+
+uint32_t resolve_default_node_id(const RunnerRack& rack, bool sink_mode) {
+    const uint32_t direct_id = sink_mode ? rack.default_sink_id : rack.default_source_id;
+    if (direct_id != PW_ID_ANY && rack.nodes.find(direct_id) != rack.nodes.end()) {
+        return direct_id;
+    }
+
+    const std::string& name = sink_mode ? rack.default_sink_name : rack.default_source_name;
+    if (!name.empty()) {
+        for (const auto& kv : rack.nodes) {
+            if (kv.second.name == name) {
+                return kv.second.id;
+            }
+        }
+    }
+
+    return PW_ID_ANY;
+}
+
+uint32_t resolve_rack_node_id(const RunnerRack& rack) {
+    const std::string expected_name = route_mode_to_node_name(rack.rack_id, rack.route_mode);
+    for (const auto& kv : rack.nodes) {
+        if (kv.second.name == expected_name) {
+            return kv.second.id;
+        }
+    }
+    return PW_ID_ANY;
+}
+
+uint32_t pick_target_port_by_channel(
+    const std::vector<RunnerRack::PortInfo>& candidates,
+    const std::string& preferred_channel,
+    size_t fallback_index) {
+    if (candidates.empty()) {
+        return PW_ID_ANY;
+    }
+
+    if (!preferred_channel.empty()) {
+        for (const auto& port : candidates) {
+            if (port.channel == preferred_channel) {
+                return port.id;
+            }
+        }
+    }
+
+    const size_t index = std::min(fallback_index, candidates.size() - 1);
+    return candidates[index].id;
+}
+
+void apply_auto_routing_locked(RunnerRack& rack) {
+    if (rack.routing_in_progress) {
+        return;
+    }
+    if (!rack.auto_route_default) {
+        return;
+    }
+    if (rack.route_mode != vessel::RackRouteMode::SINK && rack.route_mode != vessel::RackRouteMode::SOURCE) {
+        return;
+    }
+
+    const uint32_t rack_node_id = resolve_rack_node_id(rack);
+    const uint32_t default_node_id = resolve_default_node_id(rack, rack.route_mode == vessel::RackRouteMode::SINK);
+    if (rack_node_id == PW_ID_ANY || default_node_id == PW_ID_ANY) {
+        return;
+    }
+
+    rack.routing_in_progress = true;
+
+    const std::vector<RunnerRack::PortInfo> rack_inputs = collect_ports_for_node(rack, rack_node_id, "in");
+    const std::vector<RunnerRack::PortInfo> rack_outputs = collect_ports_for_node(rack, rack_node_id, "out");
+
+    if (rack.route_mode == vessel::RackRouteMode::SINK) {
+        const std::vector<RunnerRack::PortInfo> default_inputs = collect_ports_for_node(rack, default_node_id, "in");
+
+        std::vector<uint32_t> links_to_remove;
+        for (const auto& kv : rack.links) {
+            const RunnerRack::LinkInfo& link = kv.second;
+            const RunnerRack::PortInfo* out_port = find_port_by_id(rack, link.output_port_id);
+            const RunnerRack::PortInfo* in_port = find_port_by_id(rack, link.input_port_id);
+            if (!out_port || !in_port) {
+                continue;
+            }
+            if (in_port->node_id != default_node_id) {
+                continue;
+            }
+            const RunnerRack::NodeInfo* out_node = find_node_by_id(rack, out_port->node_id);
+            if (!out_node || !is_stream_output_node(*out_node)) {
+                continue;
+            }
+
+            const uint32_t rack_input_port = pick_target_port_by_channel(rack_inputs, in_port->channel, 0);
+            if (rack_input_port != PW_ID_ANY) {
+                ensure_link_locked(rack, out_port->id, rack_input_port);
+                links_to_remove.push_back(link.id);
+            }
+        }
+
+        for (uint32_t link_id : links_to_remove) {
+            destroy_link_locked(rack, link_id);
+        }
+
+        for (size_t i = 0; i < rack_outputs.size(); ++i) {
+            const uint32_t sink_in_port = pick_target_port_by_channel(default_inputs, rack_outputs[i].channel, i);
+            if (sink_in_port != PW_ID_ANY) {
+                ensure_link_locked(rack, rack_outputs[i].id, sink_in_port);
+            }
+        }
+    } else {
+        const std::vector<RunnerRack::PortInfo> default_outputs = collect_ports_for_node(rack, default_node_id, "out");
+
+        std::vector<uint32_t> links_to_remove;
+        for (const auto& kv : rack.links) {
+            const RunnerRack::LinkInfo& link = kv.second;
+            const RunnerRack::PortInfo* out_port = find_port_by_id(rack, link.output_port_id);
+            const RunnerRack::PortInfo* in_port = find_port_by_id(rack, link.input_port_id);
+            if (!out_port || !in_port) {
+                continue;
+            }
+            if (out_port->node_id != default_node_id) {
+                continue;
+            }
+            const RunnerRack::NodeInfo* in_node = find_node_by_id(rack, in_port->node_id);
+            if (!in_node || !is_stream_input_node(*in_node)) {
+                continue;
+            }
+
+            const uint32_t rack_output_port = pick_target_port_by_channel(rack_outputs, out_port->channel, 0);
+            if (rack_output_port != PW_ID_ANY) {
+                ensure_link_locked(rack, rack_output_port, in_port->id);
+                links_to_remove.push_back(link.id);
+            }
+        }
+
+        for (uint32_t link_id : links_to_remove) {
+            destroy_link_locked(rack, link_id);
+        }
+
+        for (size_t i = 0; i < default_outputs.size(); ++i) {
+            const uint32_t rack_in_port = pick_target_port_by_channel(rack_inputs, default_outputs[i].channel, i);
+            if (rack_in_port != PW_ID_ANY) {
+                ensure_link_locked(rack, default_outputs[i].id, rack_in_port);
+            }
+        }
+    }
+
+    rack.routing_in_progress = false;
 }
 
 PluginInstance* find_plugin_instance(RunnerRack& rack, uint32_t instance_id) {
@@ -243,6 +705,13 @@ void send_plugin_params_reset(int client_fd, uint32_t instance_id) {
 
 void send_rack_state_reset(int client_fd) {
     vessel::MsgRackStateReset msg;
+    send_ipc(client_fd, msg);
+}
+
+void send_rack_config_state(int client_fd, const RunnerRack& rack) {
+    vessel::MsgRackConfigState msg;
+    msg.mode = rack.route_mode;
+    msg.auto_route_default = rack.auto_route_default ? 1 : 0;
     send_ipc(client_fd, msg);
 }
 
@@ -630,6 +1099,153 @@ void send_plugin_custom_controls(int client_fd, uint32_t instance_id, RackPlugin
     }
 }
 
+void bind_default_metadata_locked(RunnerRack& rack, uint32_t id, uint32_t version) {
+    if (!rack.registry || rack.metadata != nullptr) {
+        return;
+    }
+
+    rack.metadata = static_cast<struct pw_metadata*>(
+        pw_registry_bind(rack.registry, id, PW_TYPE_INTERFACE_Metadata, version, 0));
+    if (!rack.metadata) {
+        return;
+    }
+    rack.metadata_global_id = id;
+
+    static const pw_metadata_events kMetadataEvents = [] {
+        pw_metadata_events events{};
+        events.version = PW_VERSION_METADATA_EVENTS;
+        events.property = [](void* data, uint32_t, const char* key, const char*, const char* value) -> int {
+            RunnerRack* rack = static_cast<RunnerRack*>(data);
+            if (!rack || !key) {
+                return 0;
+            }
+
+            if (std::strcmp(key, "default.audio.sink") == 0) {
+                parse_default_metadata_value(value, rack->default_sink_name, rack->default_sink_id);
+                apply_auto_routing_locked(*rack);
+            } else if (std::strcmp(key, "default.audio.source") == 0) {
+                parse_default_metadata_value(value, rack->default_source_name, rack->default_source_id);
+                apply_auto_routing_locked(*rack);
+            }
+            return 0;
+        };
+        return events;
+    }();
+
+    pw_metadata_add_listener(rack.metadata, &rack.metadata_listener, &kMetadataEvents, &rack);
+}
+
+const struct pw_core_events kCoreEvents = [] {
+    pw_core_events events{};
+    events.version = PW_VERSION_CORE_EVENTS;
+    return events;
+}();
+
+const struct pw_registry_events kRegistryEvents = [] {
+    pw_registry_events events{};
+    events.version = PW_VERSION_REGISTRY_EVENTS;
+    events.global = [](void* data, uint32_t id, uint32_t, const char* type, uint32_t version, const struct spa_dict* props) {
+        RunnerRack* rack = static_cast<RunnerRack*>(data);
+        if (!rack || !type || !props) {
+            return;
+        }
+
+        if (std::strcmp(type, PW_TYPE_INTERFACE_Node) == 0) {
+            RunnerRack::NodeInfo node;
+            node.id = id;
+            if (const char* name = spa_dict_lookup(props, PW_KEY_NODE_NAME)) {
+                node.name = name;
+            }
+            if (const char* media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS)) {
+                node.media_class = media_class;
+            }
+            rack->nodes[id] = std::move(node);
+            apply_auto_routing_locked(*rack);
+            return;
+        }
+
+        if (std::strcmp(type, PW_TYPE_INTERFACE_Port) == 0) {
+            RunnerRack::PortInfo port;
+            port.id = id;
+            if (const char* node_id = spa_dict_lookup(props, PW_KEY_NODE_ID)) {
+                parse_u32(node_id, port.node_id);
+            }
+            if (const char* direction = spa_dict_lookup(props, PW_KEY_PORT_DIRECTION)) {
+                port.direction = direction;
+            }
+            if (const char* channel = spa_dict_lookup(props, PW_KEY_AUDIO_CHANNEL)) {
+                port.channel = channel;
+            }
+            if (const char* name = spa_dict_lookup(props, PW_KEY_PORT_NAME)) {
+                port.name = name;
+            }
+            rack->ports[id] = std::move(port);
+            apply_auto_routing_locked(*rack);
+            return;
+        }
+
+        if (std::strcmp(type, PW_TYPE_INTERFACE_Link) == 0) {
+            RunnerRack::LinkInfo link;
+            link.id = id;
+            if (const char* out_port = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_PORT)) {
+                parse_u32(out_port, link.output_port_id);
+            }
+            if (const char* in_port = spa_dict_lookup(props, PW_KEY_LINK_INPUT_PORT)) {
+                parse_u32(in_port, link.input_port_id);
+            }
+            rack->links[id] = std::move(link);
+            return;
+        }
+
+        if (std::strcmp(type, PW_TYPE_INTERFACE_Metadata) == 0) {
+            const char* metadata_name = spa_dict_lookup(props, PW_KEY_METADATA_NAME);
+            if (metadata_name && std::strcmp(metadata_name, "default") == 0) {
+                bind_default_metadata_locked(*rack, id, version);
+            }
+        }
+    };
+    events.global_remove = [](void* data, uint32_t id) {
+        RunnerRack* rack = static_cast<RunnerRack*>(data);
+        if (!rack) {
+            return;
+        }
+
+        rack->links.erase(id);
+        rack->ports.erase(id);
+        rack->nodes.erase(id);
+        if (rack->metadata_global_id == id) {
+            if (rack->metadata != nullptr) {
+                spa_hook_remove(&rack->metadata_listener);
+                rack->metadata = nullptr;
+            }
+            rack->metadata_global_id = PW_ID_ANY;
+        }
+
+        apply_auto_routing_locked(*rack);
+    };
+    return events;
+}();
+
+bool setup_pipewire_control_plane(RunnerRack& rack, pw_thread_loop* thread_loop) {
+    rack.context = pw_context_new(pw_thread_loop_get_loop(thread_loop), nullptr, 0);
+    if (!rack.context) {
+        return false;
+    }
+
+    rack.core = pw_context_connect(rack.context, nullptr, 0);
+    if (!rack.core) {
+        return false;
+    }
+    pw_core_add_listener(rack.core, &rack.core_listener, &kCoreEvents, &rack);
+
+    rack.registry = pw_core_get_registry(rack.core, PW_VERSION_REGISTRY, 0);
+    if (!rack.registry) {
+        return false;
+    }
+    pw_registry_add_listener(rack.registry, &rack.registry_listener, &kRegistryEvents, &rack);
+    return true;
+}
+
 static void on_process(void* data, struct spa_io_position* position) {
     RunnerRack* rack = static_cast<RunnerRack*>(data);
 
@@ -722,15 +1338,18 @@ uint32_t parse_rack_id(int argc, char** argv) {
 }
 
 bool setup_audio(RunnerRack& rack, pw_loop* loop, uint32_t rack_id) {
-    const std::string node_name = "vessel-rack-" + std::to_string(rack_id);
+    const std::string node_name = route_mode_to_node_name(rack_id, rack.route_mode);
+    const char* media_class = route_mode_to_media_class(rack.route_mode);
     rack.filter = pw_filter_new_simple(
         loop,
         node_name.c_str(),
         pw_properties_new(
             PW_KEY_MEDIA_TYPE, "Audio",
             PW_KEY_MEDIA_CATEGORY, "Filter",
-            PW_KEY_MEDIA_CLASS, "Audio/Filter",
+            PW_KEY_MEDIA_CLASS, media_class,
             PW_KEY_NODE_NAME, node_name.c_str(),
+            PW_KEY_NODE_DESCRIPTION, node_name.c_str(),
+            PW_KEY_NODE_VIRTUAL, "true",
             nullptr),
         &kFilterEvents,
         &rack);
@@ -782,6 +1401,39 @@ bool setup_audio(RunnerRack& rack, pw_loop* loop, uint32_t rack_id) {
     return pw_filter_connect(rack.filter, PW_FILTER_FLAG_RT_PROCESS, nullptr, 0) >= 0;
 }
 
+bool reconfigure_audio_graph(RunnerRack& rack, pw_thread_loop* thread_loop, vessel::RackRouteMode new_mode) {
+    const vessel::RackRouteMode previous_mode = rack.route_mode;
+
+    if (new_mode == previous_mode) {
+        return true;
+    }
+
+    rack.route_mode = new_mode;
+    if (rack.filter != nullptr) {
+        pw_filter_destroy(rack.filter);
+        rack.filter = nullptr;
+        rack.input_ports[0] = nullptr;
+        rack.input_ports[1] = nullptr;
+        rack.output_ports[0] = nullptr;
+        rack.output_ports[1] = nullptr;
+    }
+
+    if (setup_audio(rack, pw_thread_loop_get_loop(thread_loop), rack.rack_id)) {
+        return true;
+    }
+
+    rack.route_mode = previous_mode;
+    if (rack.filter != nullptr) {
+        pw_filter_destroy(rack.filter);
+        rack.filter = nullptr;
+    }
+    rack.input_ports[0] = nullptr;
+    rack.input_ports[1] = nullptr;
+    rack.output_ports[0] = nullptr;
+    rack.output_ports[1] = nullptr;
+    return setup_audio(rack, pw_thread_loop_get_loop(thread_loop), rack.rack_id);
+}
+
 bool read_client_bytes(RunnerRack& rack, int& client_fd) {
     if (client_fd < 0) return true;
 
@@ -828,6 +1480,25 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
         } else if (hdr->type == vessel::MsgType::SET_BYPASS && frame_size == sizeof(vessel::MsgSetBypass)) {
             const auto* msg = reinterpret_cast<const vessel::MsgSetBypass*>(frame);
             rack.audio_state.bypassed.store(msg->bypassed != 0, std::memory_order_relaxed);
+        } else if (hdr->type == vessel::MsgType::REQ_RACK_CONFIG && frame_size == sizeof(vessel::MsgReqRackConfig)) {
+            send_rack_config_state(client_fd, rack);
+        } else if (hdr->type == vessel::MsgType::SET_RACK_CONFIG && frame_size == sizeof(vessel::MsgSetRackConfig)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgSetRackConfig*>(frame);
+
+            vessel::RackRouteMode next_mode = msg->mode;
+            if (next_mode != vessel::RackRouteMode::FILTER
+                && next_mode != vessel::RackRouteMode::SINK
+                && next_mode != vessel::RackRouteMode::SOURCE) {
+                next_mode = vessel::RackRouteMode::FILTER;
+            }
+
+            pw_thread_loop_lock(thread_loop);
+            reconfigure_audio_graph(rack, thread_loop, next_mode);
+            rack.auto_route_default = msg->auto_route_default != 0;
+            apply_auto_routing_locked(rack);
+            pw_thread_loop_unlock(thread_loop);
+
+            send_rack_config_state(client_fd, rack);
         } else if (hdr->type == vessel::MsgType::REQ_PLUGIN_CATALOG && frame_size == sizeof(vessel::MsgReqPluginCatalog)) {
             send_plugin_catalog(client_fd);
         } else if (hdr->type == vessel::MsgType::REQ_LV2_CATALOG && frame_size == sizeof(vessel::MsgReqLv2Catalog)) {
@@ -1109,14 +1780,19 @@ int main(int argc, char* argv[]) {
     }
 
     RunnerRack rack;
+    rack.rack_id = rack_id;
+    rack.route_mode = vessel::RackRouteMode::FILTER;
+    rack.auto_route_default = false;
     rack.lv2_plugins = scan_lv2_plugins();
 
     pw_thread_loop_lock(thread_loop);
-    bool ok = setup_audio(rack, pw_thread_loop_get_loop(thread_loop), rack_id);
+    bool ok = setup_pipewire_control_plane(rack, thread_loop)
+        && setup_audio(rack, pw_thread_loop_get_loop(thread_loop), rack_id);
     pw_thread_loop_unlock(thread_loop);
 
     if (!ok) {
-        std::cerr << "failed to initialize runner for rack id: " << rack_id << std::endl;
+        std::cerr << "failed to initialize runner for rack id: " << rack_id
+                  << " (PipeWire control/audio setup failed)" << std::endl;
         pw_thread_loop_stop(thread_loop);
         pw_thread_loop_destroy(thread_loop);
         pw_deinit();
@@ -1169,6 +1845,7 @@ int main(int argc, char* argv[]) {
                     client_fd = new_fd;
                     rack.rx_buffer.clear();
                     ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
+                    send_rack_config_state(client_fd, rack);
                 }
             }
 

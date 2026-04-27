@@ -5,6 +5,7 @@
 - [x] Add support for more plugin GUI elements for custom plugins (e.g. knobs, buttons, file selectors, etc.)
 - [x] Create customizable soundboard plugin.
 - [x] BUG: adding or removing LV2 plugins causes the runner to crash.
+- [ ] Rack configuration popup (right click rack and select "Configure") that allows setting a rack to a sink (desktop sound filter) or source (microphone filter). These should work like easyeffects where they auto route to the default sink/source. and make other apps route to the rack when they output to the default sink/source. This will allow using vessel as a system-wide audio processor for things like applying effects to your microphone or desktop audio.
 - [ ] Make audio more stable (there is occasional glitching in helvum, or cracking if the input source isn't currently playing something) and support more sample rates, buffer sizes, and channel configurations (e.g. mono, stereo, etc).
 - [x] Polish the user interface and make it more user-friendly (e.g. add tooltips, improve the layout, etc.) Maybe use ImGui's theme system to make it look nicer.
 - [x] Add support for saving entire rack to a file and loading it back (all plugins and their states).

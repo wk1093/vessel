@@ -89,6 +89,9 @@ struct Rack {
 
     bool open_plugin_browser = false;
     bool open_lv2_browser = false;
+    vessel::RackRouteMode route_mode = vessel::RackRouteMode::FILTER;
+    bool auto_route_default = false;
+    bool needs_rack_config_sync = false;
     std::vector<RackPluginType> available_plugins;
     std::vector<RackPluginType> available_lv2_plugins;
     std::vector<RackPluginInstance> plugins;
@@ -348,8 +351,21 @@ void try_connect_socket(Rack& rack) {
         ::fcntl(fd, F_SETFL, O_NONBLOCK);
         rack.sock_fd = fd;
         rack.rx_buffer.clear();
+        rack.needs_rack_config_sync = true;
     } else {
         ::close(fd);
+    }
+}
+
+const char* rack_route_mode_label(vessel::RackRouteMode mode) {
+    switch (mode) {
+        case vessel::RackRouteMode::SINK:
+            return "Sink";
+        case vessel::RackRouteMode::SOURCE:
+            return "Source";
+        case vessel::RackRouteMode::FILTER:
+        default:
+            return "Filter";
     }
 }
 
@@ -751,6 +767,12 @@ void drain_ipc(Rack& rack) {
                 control_ptr->label = msg->label;
                 control_ptr->text_value = msg->text_value;
             }
+        } else if (hdr->type == vessel::MsgType::RACK_CONFIG_STATE
+                   && frame_size == sizeof(vessel::MsgRackConfigState)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgRackConfigState*>(frame);
+            rack.route_mode = msg->mode;
+            rack.auto_route_default = msg->auto_route_default != 0;
+            rack.needs_rack_config_sync = false;
         }
 
         rack.rx_buffer.erase(rack.rx_buffer.begin(), rack.rx_buffer.begin() + static_cast<long>(frame_size));
@@ -967,6 +989,11 @@ int main(int, char* argv[]) {
     uint32_t plugin_for_preset_action = 0;
     char preset_file_buf[vessel::kMaxFilePathLen + 1]{};
 
+    bool show_rack_config = false;
+    int rack_for_config_action = -1;
+    vessel::RackRouteMode config_route_mode = vessel::RackRouteMode::FILTER;
+    bool config_auto_route_default = false;
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -1031,6 +1058,18 @@ int main(int, char* argv[]) {
             ImGui::TextColored(
                 connected ? ImVec4(0.3f, 0.8f, 0.3f, 1.0f) : ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
                 connected ? "IPC Connected" : "IPC Disconnected");
+            ImGui::SameLine();
+            ImGui::Text("Mode: %s", rack_route_mode_label(rack.route_mode));
+            if (rack.auto_route_default) {
+                ImGui::SameLine();
+                ImGui::TextUnformatted("(Auto default route)");
+            }
+
+            if (connected && rack.needs_rack_config_sync) {
+                vessel::MsgReqRackConfig msg;
+                send_ipc(rack, msg);
+                rack.needs_rack_config_sync = false;
+            }
             ImGui::Separator();
 
             if (ImGui::SliderFloat("Master Gain", &rack.master_gain, 0.0f, 2.0f)) {
@@ -1297,6 +1336,12 @@ int main(int, char* argv[]) {
                     rack_for_file_action = r;
                     std::snprintf(rack_file_buf, sizeof(rack_file_buf), "rack-%u.vrk", rack.id);
                 }
+                if (ImGui::MenuItem("Configure Rack")) {
+                    show_rack_config = true;
+                    rack_for_config_action = r;
+                    config_route_mode = rack.route_mode;
+                    config_auto_route_default = rack.auto_route_default;
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Rename Rack")) {
                     show_rename = true;
@@ -1499,6 +1544,51 @@ int main(int, char* argv[]) {
 
         if (show_confirm_delete) {
             ImGui::OpenPopup("Confirm Delete?");
+        }
+
+        if (show_rack_config) {
+            ImGui::OpenPopup("Configure Rack Routing");
+            show_rack_config = false;
+        }
+
+        if (ImGui::BeginPopupModal("Configure Rack Routing", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            static constexpr const char* mode_labels[] = {
+                "Filter (manual graph patching)",
+                "Sink (desktop output filter)",
+                "Source (microphone filter)",
+            };
+
+            int mode_index = static_cast<int>(config_route_mode);
+            mode_index = std::clamp(mode_index, 0, 2);
+            ImGui::TextUnformatted("Rack mode:");
+            ImGui::SetNextItemWidth(360.0f);
+            if (ImGui::Combo("##rack_route_mode", &mode_index, mode_labels, IM_ARRAYSIZE(mode_labels))) {
+                config_route_mode = static_cast<vessel::RackRouteMode>(mode_index);
+            }
+
+            ImGui::Checkbox("Auto route as default device", &config_auto_route_default);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("Attempts to make this rack the current default sink/source when mode is Sink/Source");
+            }
+
+            ImGui::Separator();
+            if (ImGui::Button("Apply", ImVec2(120, 0))) {
+                if (rack_for_config_action >= 0 && rack_for_config_action < static_cast<int>(racks.size())) {
+                    vessel::MsgSetRackConfig msg;
+                    msg.mode = config_route_mode;
+                    msg.auto_route_default = config_auto_route_default ? 1 : 0;
+                    send_ipc(*racks[rack_for_config_action], msg);
+                }
+                rack_for_config_action = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                rack_for_config_action = -1;
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::EndPopup();
         }
 
         if (ImGui::BeginPopupModal("Confirm Delete?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {

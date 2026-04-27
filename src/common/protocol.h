@@ -43,6 +43,9 @@ enum class MsgType : uint8_t {
     TRIGGER_PLUGIN_CUSTOM_ACTION = 0x25, // GUI -> runner
     SET_PLUGIN_CUSTOM_TEXT = 0x26, // GUI -> runner
     PLUGIN_PARAMS_RESET  = 0x27,  // runner -> GUI
+    REQ_RACK_CONFIG      = 0x28,  // GUI -> runner
+    SET_RACK_CONFIG      = 0x29,  // GUI -> runner
+    RACK_CONFIG_STATE    = 0x2A,  // runner -> GUI
 };
 
 enum class ParamWidget : uint8_t {
@@ -70,6 +73,12 @@ enum class CustomControlTextMode : uint8_t {
     NONE = 0,
     FILE_PATH = 1,
     PLAIN_TEXT = 2,
+};
+
+enum class RackRouteMode : uint8_t {
+    FILTER = 0,
+    SINK = 1,
+    SOURCE = 2,
 };
 
 enum ParamFlags : uint8_t {
@@ -254,6 +263,22 @@ struct __attribute__((packed)) MsgSetPluginCustomText {
 struct __attribute__((packed)) MsgPluginParamsReset {
     MsgHeader hdr{MsgType::PLUGIN_PARAMS_RESET, sizeof(MsgPluginParamsReset)};
     uint32_t instance_id{0};
+};
+
+struct __attribute__((packed)) MsgReqRackConfig {
+    MsgHeader hdr{MsgType::REQ_RACK_CONFIG, sizeof(MsgReqRackConfig)};
+};
+
+struct __attribute__((packed)) MsgSetRackConfig {
+    MsgHeader hdr{MsgType::SET_RACK_CONFIG, sizeof(MsgSetRackConfig)};
+    RackRouteMode mode{RackRouteMode::FILTER};
+    uint8_t auto_route_default{0};
+};
+
+struct __attribute__((packed)) MsgRackConfigState {
+    MsgHeader hdr{MsgType::RACK_CONFIG_STATE, sizeof(MsgRackConfigState)};
+    RackRouteMode mode{RackRouteMode::FILTER};
+    uint8_t auto_route_default{0};
 };
 
 }  // namespace vessel
