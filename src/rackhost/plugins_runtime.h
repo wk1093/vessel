@@ -56,6 +56,9 @@ public:
     virtual void trigger_custom_action(uint32_t) {}
     virtual void set_custom_text(uint32_t, const std::string&) {}
     virtual uint64_t ui_schema_version() const { return 0; }
+
+    virtual std::vector<std::pair<std::string, std::string>> save_state() const { return {}; }
+    virtual void load_state(const std::vector<std::pair<std::string, std::string>>&) {}
 };
 
 struct DiscoveredLv2Plugin {

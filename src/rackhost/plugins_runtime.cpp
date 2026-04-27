@@ -452,6 +452,77 @@ public:
         return ui_schema_version_;
     }
 
+    std::vector<std::pair<std::string, std::string>> save_state() const override {
+        std::vector<std::pair<std::string, std::string>> out;
+        out.emplace_back("sound_count", std::to_string(sounds_.size()));
+        for (size_t i = 0; i < sounds_.size(); ++i) {
+            if (!sounds_[i].path.empty()) {
+                out.emplace_back("sound_path_" + std::to_string(i), sounds_[i].path);
+            }
+        }
+        return out;
+    }
+
+    void load_state(const std::vector<std::pair<std::string, std::string>>& state) override {
+        if (state.empty()) {
+            return;
+        }
+
+        size_t target_count = 1;
+        std::vector<std::pair<size_t, std::string>> paths;
+
+        for (const auto& kv : state) {
+            if (kv.first == "sound_count") {
+                try {
+                    target_count = static_cast<size_t>(std::stoul(kv.second));
+                } catch (...) {
+                    target_count = 1;
+                }
+                target_count = std::clamp<size_t>(target_count, 1, 64);
+                continue;
+            }
+
+            static constexpr const char* kSoundPathPrefix = "sound_path_";
+            if (kv.first.rfind(kSoundPathPrefix, 0) == 0) {
+                const std::string index_str = kv.first.substr(std::char_traits<char>::length(kSoundPathPrefix));
+                try {
+                    const size_t idx = static_cast<size_t>(std::stoul(index_str));
+                    paths.emplace_back(idx, kv.second);
+                } catch (...) {
+                }
+            }
+        }
+
+        sounds_.clear();
+        sounds_.reserve(target_count);
+        for (size_t i = 0; i < target_count; ++i) {
+            LoadedSound slot;
+            slot.label = slot_label(i);
+            slot.sample_rate = 48000;
+            sounds_.push_back(std::move(slot));
+        }
+
+        for (auto& voice : voices_) {
+            voice.active = false;
+            voice.sound_index = 0;
+            voice.position = 0.0f;
+            voice.step = 1.0f;
+        }
+
+        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
+            const int clamped = std::clamp(sound_select_[pad].load(std::memory_order_relaxed), 0, static_cast<int>(target_count - 1));
+            sound_select_[pad].store(clamped, std::memory_order_relaxed);
+        }
+
+        for (const auto& entry : paths) {
+            if (entry.first < sounds_.size()) {
+                load_sound_into_slot(entry.first, entry.second);
+            }
+        }
+
+        ++ui_schema_version_;
+    }
+
 private:
     struct LoadedSound {
         std::string label;

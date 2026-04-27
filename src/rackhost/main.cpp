@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -52,6 +53,7 @@ struct SavedPluginState {
     std::string plugin_id;
     bool bypassed = false;
     std::vector<std::pair<uint32_t, float>> params;
+    std::vector<std::pair<std::string, std::string>> state;
 };
 
 struct SavedRackState {
@@ -330,7 +332,7 @@ bool save_rack_to_file(const RunnerRack& rack, const std::string& path) {
         return false;
     }
 
-    out << "VSRK1\n";
+    out << "VSRK2\n";
     out << "master_gain " << rack.audio_state.volume.load(std::memory_order_relaxed) << "\n";
     out << "bypassed " << (rack.audio_state.bypassed.load(std::memory_order_relaxed) ? 1 : 0) << "\n";
     out << "plugin_count " << rack.plugins.size() << "\n";
@@ -338,10 +340,14 @@ bool save_rack_to_file(const RunnerRack& rack, const std::string& path) {
     for (const auto& instance : rack.plugins) {
         const std::string plugin_id = plugin_identity_for_instance(rack, instance);
         const std::vector<PluginParamSpec> specs = instance.plugin ? instance.plugin->param_specs() : std::vector<PluginParamSpec>{};
-        out << "plugin " << plugin_id << " " << (instance.bypassed ? 1 : 0) << " " << specs.size() << "\n";
+        const std::vector<std::pair<std::string, std::string>> plugin_state = instance.plugin ? instance.plugin->save_state() : std::vector<std::pair<std::string, std::string>>{};
+        out << "plugin " << plugin_id << " " << (instance.bypassed ? 1 : 0) << " " << specs.size() << " " << plugin_state.size() << "\n";
         for (const auto& spec : specs) {
             const float value = instance.plugin->get_param(spec.id);
             out << "param " << spec.id << " " << value << "\n";
+        }
+        for (const auto& kv : plugin_state) {
+            out << "state " << std::quoted(kv.first) << " " << std::quoted(kv.second) << "\n";
         }
     }
 
@@ -356,7 +362,9 @@ bool load_rack_from_file(const std::string& path, SavedRackState& out_state) {
 
     std::string magic;
     in >> magic;
-    if (!in.good() || magic != "VSRK1") {
+    const bool is_v1 = (magic == "VSRK1");
+    const bool is_v2 = (magic == "VSRK2");
+    if (!in.good() || (!is_v1 && !is_v2)) {
         return false;
     }
 
@@ -386,9 +394,13 @@ bool load_rack_from_file(const std::string& path, SavedRackState& out_state) {
         SavedPluginState plugin;
         int plugin_bypassed = 0;
         size_t param_count = 0;
+        size_t state_count = 0;
 
         std::string plugin_token;
         in >> key >> plugin_token >> plugin_bypassed >> param_count;
+        if (is_v2) {
+            in >> state_count;
+        }
         if (!in.good() || key != "plugin") {
             return false;
         }
@@ -404,6 +416,17 @@ bool load_rack_from_file(const std::string& path, SavedRackState& out_state) {
                 return false;
             }
             plugin.params.push_back({param_id, value});
+        }
+
+        plugin.state.reserve(state_count);
+        for (size_t s = 0; s < state_count; ++s) {
+            std::string state_key;
+            std::string state_value;
+            in >> key >> std::quoted(state_key) >> std::quoted(state_value);
+            if (!in.good() || key != "state") {
+                return false;
+            }
+            plugin.state.push_back({std::move(state_key), std::move(state_value)});
         }
 
         out_state.plugins.push_back(std::move(plugin));
@@ -433,18 +456,27 @@ bool save_plugin_preset_to_file(const RunnerRack& rack, const PluginInstance& in
 
     const std::vector<PluginParamSpec> specs = instance.plugin->param_specs();
     const std::string plugin_id = plugin_identity_for_instance(rack, instance);
-    out << "VSPT1\n";
+    out << "VSPT2\n";
     out << "plugin_id " << plugin_id << "\n";
     out << "param_count " << specs.size() << "\n";
+    const std::vector<std::pair<std::string, std::string>> plugin_state = instance.plugin->save_state();
+    out << "state_count " << plugin_state.size() << "\n";
     for (const auto& spec : specs) {
         const float value = instance.plugin->get_param(spec.id);
         out << "param " << spec.id << " " << value << "\n";
+    }
+    for (const auto& kv : plugin_state) {
+        out << "state " << std::quoted(kv.first) << " " << std::quoted(kv.second) << "\n";
     }
 
     return out.good();
 }
 
-bool load_plugin_preset_from_file(const std::string& path, std::string& plugin_id_out, std::vector<std::pair<uint32_t, float>>& params_out) {
+bool load_plugin_preset_from_file(
+    const std::string& path,
+    std::string& plugin_id_out,
+    std::vector<std::pair<uint32_t, float>>& params_out,
+    std::vector<std::pair<std::string, std::string>>& state_out) {
     std::ifstream in(path);
     if (!in.is_open()) {
         return false;
@@ -452,7 +484,9 @@ bool load_plugin_preset_from_file(const std::string& path, std::string& plugin_i
 
     std::string magic;
     in >> magic;
-    if (!in.good() || magic != "VSPT1") {
+    const bool is_v1 = (magic == "VSPT1");
+    const bool is_v2 = (magic == "VSPT2");
+    if (!in.good() || (!is_v1 && !is_v2)) {
         return false;
     }
 
@@ -480,6 +514,14 @@ bool load_plugin_preset_from_file(const std::string& path, std::string& plugin_i
         return false;
     }
 
+    size_t state_count = 0;
+    if (is_v2) {
+        in >> key >> state_count;
+        if (!in.good() || key != "state_count") {
+            return false;
+        }
+    }
+
     params_out.clear();
     params_out.reserve(param_count);
 
@@ -491,6 +533,18 @@ bool load_plugin_preset_from_file(const std::string& path, std::string& plugin_i
             return false;
         }
         params_out.push_back({param_id, value});
+    }
+
+    state_out.clear();
+    state_out.reserve(state_count);
+    for (size_t i = 0; i < state_count; ++i) {
+        std::string state_key;
+        std::string state_value;
+        in >> key >> std::quoted(state_key) >> std::quoted(state_value);
+        if (!in.good() || key != "state") {
+            return false;
+        }
+        state_out.push_back({std::move(state_key), std::move(state_value)});
     }
 
     return true;
@@ -940,6 +994,8 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                 instance.bypassed = saved.bypassed;
                 instance.plugin = std::move(plugin);
 
+                instance.plugin->load_state(saved.state);
+
                 for (const auto& param : saved.params) {
                     instance.plugin->set_param(param.first, param.second);
                 }
@@ -970,7 +1026,8 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
 
             std::string preset_plugin_id;
             std::vector<std::pair<uint32_t, float>> params;
-            if (!load_plugin_preset_from_file(path, preset_plugin_id, params)) {
+            std::vector<std::pair<std::string, std::string>> preset_state;
+            if (!load_plugin_preset_from_file(path, preset_plugin_id, params, preset_state)) {
                 rack.rx_buffer.erase(rack.rx_buffer.begin(), rack.rx_buffer.begin() + static_cast<long>(frame_size));
                 continue;
             }
@@ -980,6 +1037,7 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
             uint32_t preset_type_id = 0;
             const bool resolved = resolve_plugin_type_id(rack, preset_plugin_id, preset_type_id);
             if (instance && instance->plugin && resolved && instance->plugin->type_id() == preset_type_id) {
+                instance->plugin->load_state(preset_state);
                 for (const auto& param : params) {
                     instance->plugin->set_param(param.first, param.second);
                 }
