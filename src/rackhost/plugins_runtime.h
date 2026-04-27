@@ -27,6 +27,14 @@ struct PluginParamSpec {
     float ui_width{0.0f};
 };
 
+struct PluginCustomControlSpec {
+    uint32_t action_id;
+    std::string label;
+    bool expects_text{false};
+    vessel::ParamLayoutHint layout{vessel::ParamLayoutHint::AUTO};
+    float ui_width{0.0f};
+};
+
 class RackPlugin {
 public:
     virtual ~RackPlugin() = default;
@@ -43,6 +51,11 @@ public:
     virtual void close_custom_ui() {}
     virtual bool is_custom_ui_open() const { return false; }
     virtual void pump_ui() {}
+
+    virtual std::vector<PluginCustomControlSpec> custom_controls() const { return {}; }
+    virtual void trigger_custom_action(uint32_t) {}
+    virtual void set_custom_text(uint32_t, const std::string&) {}
+    virtual uint64_t ui_schema_version() const { return 0; }
 };
 
 struct DiscoveredLv2Plugin {

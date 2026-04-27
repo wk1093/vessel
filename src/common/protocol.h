@@ -39,6 +39,10 @@ enum class MsgType : uint8_t {
     SAVE_PLUGIN_PRESET   = 0x21,  // GUI -> runner
     LOAD_PLUGIN_PRESET   = 0x22,  // GUI -> runner
     RACK_STATE_RESET     = 0x23,  // runner -> GUI
+    PLUGIN_CUSTOM_CONTROL = 0x24, // runner -> GUI
+    TRIGGER_PLUGIN_CUSTOM_ACTION = 0x25, // GUI -> runner
+    SET_PLUGIN_CUSTOM_TEXT = 0x26, // GUI -> runner
+    PLUGIN_PARAMS_RESET  = 0x27,  // runner -> GUI
 };
 
 enum class ParamWidget : uint8_t {
@@ -214,6 +218,35 @@ struct __attribute__((packed)) MsgLoadPluginPreset {
 
 struct __attribute__((packed)) MsgRackStateReset {
     MsgHeader hdr{MsgType::RACK_STATE_RESET, sizeof(MsgRackStateReset)};
+};
+
+struct __attribute__((packed)) MsgPluginCustomControl {
+    MsgHeader hdr{MsgType::PLUGIN_CUSTOM_CONTROL, sizeof(MsgPluginCustomControl)};
+    uint32_t instance_id{0};
+    uint32_t action_id{0};
+    uint8_t expects_text{0};
+    ParamLayoutHint layout{ParamLayoutHint::AUTO};
+    float ui_width{0.0f};
+    char label[kMaxParamNameLen + 1]{};
+    uint8_t is_last{0};
+};
+
+struct __attribute__((packed)) MsgTriggerPluginCustomAction {
+    MsgHeader hdr{MsgType::TRIGGER_PLUGIN_CUSTOM_ACTION, sizeof(MsgTriggerPluginCustomAction)};
+    uint32_t instance_id{0};
+    uint32_t action_id{0};
+};
+
+struct __attribute__((packed)) MsgSetPluginCustomText {
+    MsgHeader hdr{MsgType::SET_PLUGIN_CUSTOM_TEXT, sizeof(MsgSetPluginCustomText)};
+    uint32_t instance_id{0};
+    uint32_t action_id{0};
+    char text[kMaxFilePathLen + 1]{};
+};
+
+struct __attribute__((packed)) MsgPluginParamsReset {
+    MsgHeader hdr{MsgType::PLUGIN_PARAMS_RESET, sizeof(MsgPluginParamsReset)};
+    uint32_t instance_id{0};
 };
 
 }  // namespace vessel

@@ -45,6 +45,7 @@ struct PluginInstance {
     bool custom_ui_open = false;
     std::vector<PluginParamSpec> param_specs;
     std::vector<float> last_param_values;
+    uint64_t last_ui_schema_version = 0;
 };
 
 struct SavedPluginState {
@@ -81,15 +82,6 @@ struct RunnerRack {
 
 void signal_handler(int) {
     g_running.store(false);
-}
-
-RackPlugin* find_plugin(RunnerRack& rack, uint32_t instance_id) {
-    for (auto& instance : rack.plugins) {
-        if (instance.instance_id == instance_id) {
-            return instance.plugin.get();
-        }
-    }
-    return nullptr;
 }
 
 PluginInstance* find_plugin_instance(RunnerRack& rack, uint32_t instance_id) {
@@ -236,6 +228,14 @@ void send_plugin_ui_state(int client_fd, uint32_t instance_id, bool is_open) {
 
 void send_plugin_params(int client_fd, uint32_t instance_id, RackPlugin& plugin);
 
+void send_plugin_custom_controls(int client_fd, uint32_t instance_id, RackPlugin& plugin);
+
+void send_plugin_params_reset(int client_fd, uint32_t instance_id) {
+    vessel::MsgPluginParamsReset msg;
+    msg.instance_id = instance_id;
+    send_ipc(client_fd, msg);
+}
+
 void send_rack_state_reset(int client_fd) {
     vessel::MsgRackStateReset msg;
     send_ipc(client_fd, msg);
@@ -278,6 +278,7 @@ void send_plugin_param_enum_options(int client_fd, uint32_t instance_id, const P
 
 void refresh_plugin_param_cache(PluginInstance& instance) {
     instance.param_specs = instance.plugin->param_specs();
+    instance.last_ui_schema_version = instance.plugin->ui_schema_version();
     instance.last_param_values.clear();
     instance.last_param_values.reserve(instance.param_specs.size());
     for (const auto& spec : instance.param_specs) {
@@ -510,6 +511,7 @@ void send_plugin_instance_state(int client_fd, const PluginInstance& instance) {
 
     send_plugin_ui_state(client_fd, instance.instance_id, instance.custom_ui_open);
     send_plugin_params(client_fd, instance.instance_id, *instance.plugin);
+    send_plugin_custom_controls(client_fd, instance.instance_id, *instance.plugin);
 }
 
 void send_plugin_catalog(int client_fd) {
@@ -550,6 +552,22 @@ void send_plugin_params(int client_fd, uint32_t instance_id, RackPlugin& plugin)
         const float value = plugin.get_param(specs[i].id);
         send_plugin_param_desc_value(client_fd, instance_id, specs[i], value, (i + 1 == specs.size()) ? 1 : 0);
         send_plugin_param_enum_options(client_fd, instance_id, specs[i]);
+    }
+}
+
+void send_plugin_custom_controls(int client_fd, uint32_t instance_id, RackPlugin& plugin) {
+    const std::vector<PluginCustomControlSpec> controls = plugin.custom_controls();
+    for (size_t i = 0; i < controls.size(); ++i) {
+        vessel::MsgPluginCustomControl msg;
+        msg.instance_id = instance_id;
+        msg.action_id = controls[i].action_id;
+        msg.expects_text = controls[i].expects_text ? 1 : 0;
+        msg.layout = controls[i].layout;
+        msg.ui_width = controls[i].ui_width;
+        std::strncpy(msg.label, controls[i].label.c_str(), vessel::kMaxParamNameLen);
+        msg.label[vessel::kMaxParamNameLen] = '\0';
+        msg.is_last = (i + 1 == controls.size()) ? 1 : 0;
+        send_ipc(client_fd, msg);
     }
 }
 
@@ -781,17 +799,27 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
         } else if (hdr->type == vessel::MsgType::REQ_PLUGIN_PARAMS && frame_size == sizeof(vessel::MsgReqPluginParams)) {
             const auto* msg = reinterpret_cast<const vessel::MsgReqPluginParams*>(frame);
             pw_thread_loop_lock(thread_loop);
-            RackPlugin* plugin = find_plugin(rack, msg->instance_id);
-            if (plugin) {
-                send_plugin_params(client_fd, msg->instance_id, *plugin);
+            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+            if (instance && instance->plugin) {
+                send_plugin_params_reset(client_fd, msg->instance_id);
+                send_plugin_params(client_fd, msg->instance_id, *instance->plugin);
+                send_plugin_custom_controls(client_fd, msg->instance_id, *instance->plugin);
             }
             pw_thread_loop_unlock(thread_loop);
         } else if (hdr->type == vessel::MsgType::SET_PLUGIN_PARAM && frame_size == sizeof(vessel::MsgSetPluginParam)) {
             const auto* msg = reinterpret_cast<const vessel::MsgSetPluginParam*>(frame);
             pw_thread_loop_lock(thread_loop);
-            RackPlugin* plugin = find_plugin(rack, msg->instance_id);
-            if (plugin) {
-                plugin->set_param(msg->param_id, msg->value);
+            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+            if (instance && instance->plugin) {
+                const uint64_t before = instance->plugin->ui_schema_version();
+                instance->plugin->set_param(msg->param_id, msg->value);
+                const uint64_t after = instance->plugin->ui_schema_version();
+                if (after != before) {
+                    refresh_plugin_param_cache(*instance);
+                    send_plugin_params_reset(client_fd, msg->instance_id);
+                    send_plugin_params(client_fd, msg->instance_id, *instance->plugin);
+                    send_plugin_custom_controls(client_fd, msg->instance_id, *instance->plugin);
+                }
             }
             pw_thread_loop_unlock(thread_loop);
         } else if (hdr->type == vessel::MsgType::REMOVE_PLUGIN && frame_size == sizeof(vessel::MsgRemovePlugin)) {
@@ -830,6 +858,41 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                 const bool is_open = instance->plugin->is_custom_ui_open();
                 instance->custom_ui_open = is_open;
                 send_plugin_ui_state(client_fd, msg->instance_id, is_open);
+            }
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::TRIGGER_PLUGIN_CUSTOM_ACTION
+                   && frame_size == sizeof(vessel::MsgTriggerPluginCustomAction)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgTriggerPluginCustomAction*>(frame);
+            pw_thread_loop_lock(thread_loop);
+            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+            if (instance && instance->plugin) {
+                const uint64_t before = instance->plugin->ui_schema_version();
+                instance->plugin->trigger_custom_action(msg->action_id);
+                const uint64_t after = instance->plugin->ui_schema_version();
+                if (after != before) {
+                    refresh_plugin_param_cache(*instance);
+                    send_plugin_params_reset(client_fd, msg->instance_id);
+                    send_plugin_params(client_fd, msg->instance_id, *instance->plugin);
+                    send_plugin_custom_controls(client_fd, msg->instance_id, *instance->plugin);
+                }
+            }
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::SET_PLUGIN_CUSTOM_TEXT
+                   && frame_size == sizeof(vessel::MsgSetPluginCustomText)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgSetPluginCustomText*>(frame);
+            const std::string text = cstr_from_fixed(msg->text, vessel::kMaxFilePathLen);
+            pw_thread_loop_lock(thread_loop);
+            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+            if (instance && instance->plugin) {
+                const uint64_t before = instance->plugin->ui_schema_version();
+                instance->plugin->set_custom_text(msg->action_id, text);
+                const uint64_t after = instance->plugin->ui_schema_version();
+                if (after != before) {
+                    refresh_plugin_param_cache(*instance);
+                    send_plugin_params_reset(client_fd, msg->instance_id);
+                    send_plugin_params(client_fd, msg->instance_id, *instance->plugin);
+                    send_plugin_custom_controls(client_fd, msg->instance_id, *instance->plugin);
+                }
             }
             pw_thread_loop_unlock(thread_loop);
         } else if (hdr->type == vessel::MsgType::SAVE_RACK_TO_FILE && frame_size == sizeof(vessel::MsgSaveRackToFile)) {

@@ -52,6 +52,14 @@ struct RackPluginParam {
     std::vector<EnumOption> enum_options;
 };
 
+struct RackPluginCustomControl {
+    uint32_t action_id = 0;
+    bool expects_text = false;
+    vessel::ParamLayoutHint layout = vessel::ParamLayoutHint::AUTO;
+    float ui_width = 0.0f;
+    std::string label;
+};
+
 struct RackPluginInstance {
     uint32_t instance_id = 0;
     uint32_t plugin_type_id = 0;
@@ -61,6 +69,7 @@ struct RackPluginInstance {
     bool is_open = true;
     bool host_ui_detached = false;
     std::vector<RackPluginParam> params;
+    std::vector<RackPluginCustomControl> custom_controls;
 };
 
 struct Rack {
@@ -238,6 +247,22 @@ void send_param_update(Rack& rack, const RackPluginInstance& plugin, const RackP
     send_ipc(rack, msg);
 }
 
+void send_custom_action(Rack& rack, const RackPluginInstance& plugin, uint32_t action_id) {
+    vessel::MsgTriggerPluginCustomAction msg;
+    msg.instance_id = plugin.instance_id;
+    msg.action_id = action_id;
+    send_ipc(rack, msg);
+}
+
+void send_custom_text(Rack& rack, const RackPluginInstance& plugin, uint32_t action_id, const std::string& text) {
+    vessel::MsgSetPluginCustomText msg;
+    msg.instance_id = plugin.instance_id;
+    msg.action_id = action_id;
+    std::strncpy(msg.text, text.c_str(), vessel::kMaxFilePathLen);
+    msg.text[vessel::kMaxFilePathLen] = '\0';
+    send_ipc(rack, msg);
+}
+
 bool draw_knob(const char* label, float* value, float min_value, float max_value);
 
 void render_plugin_params(Rack& rack, RackPluginInstance& plugin) {
@@ -344,6 +369,32 @@ void render_plugin_params(Rack& rack, RackPluginInstance& plugin) {
     }
 }
 
+void render_plugin_custom_controls(Rack& rack, RackPluginInstance& plugin) {
+    for (auto& control : plugin.custom_controls) {
+        ImGui::PushID(static_cast<int>(control.action_id));
+
+        if (control.layout == vessel::ParamLayoutHint::SAME_LINE) {
+            ImGui::SameLine();
+        }
+        if (control.ui_width > 0.0f) {
+            ImGui::SetNextItemWidth(control.ui_width);
+        }
+
+        if (ImGui::Button(control.label.c_str())) {
+            if (control.expects_text) {
+                std::string chosen;
+                if (open_file_picker(false, control.label.c_str(), std::string(), chosen)) {
+                    send_custom_text(rack, plugin, control.action_id, chosen);
+                }
+            } else {
+                send_custom_action(rack, plugin, control.action_id);
+            }
+        }
+
+        ImGui::PopID();
+    }
+}
+
 RackPluginInstance* find_plugin_instance(Rack& rack, uint32_t instance_id) {
     for (auto& plugin : rack.plugins) {
         if (plugin.instance_id == instance_id) {
@@ -432,6 +483,14 @@ void drain_ipc(Rack& rack) {
         } else if (hdr->type == vessel::MsgType::RACK_STATE_RESET
                    && frame_size == sizeof(vessel::MsgRackStateReset)) {
             rack.plugins.clear();
+        } else if (hdr->type == vessel::MsgType::PLUGIN_PARAMS_RESET
+                   && frame_size == sizeof(vessel::MsgPluginParamsReset)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgPluginParamsReset*>(frame);
+            RackPluginInstance* plugin = find_plugin_instance(rack, msg->instance_id);
+            if (plugin) {
+                plugin->params.clear();
+                plugin->custom_controls.clear();
+            }
         } else if (hdr->type == vessel::MsgType::PLUGIN_CATALOG_ENTRY
                    && frame_size == sizeof(vessel::MsgPluginCatalogEntry)) {
             const auto* msg = reinterpret_cast<const vessel::MsgPluginCatalogEntry*>(frame);
@@ -533,6 +592,28 @@ void drain_ipc(Rack& rack) {
                         });
                     break;
                 }
+            }
+        } else if (hdr->type == vessel::MsgType::PLUGIN_CUSTOM_CONTROL
+                   && frame_size == sizeof(vessel::MsgPluginCustomControl)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgPluginCustomControl*>(frame);
+            RackPluginInstance* plugin = find_plugin_instance(rack, msg->instance_id);
+            if (plugin) {
+                RackPluginCustomControl* control_ptr = nullptr;
+                for (auto& existing : plugin->custom_controls) {
+                    if (existing.action_id == msg->action_id) {
+                        control_ptr = &existing;
+                        break;
+                    }
+                }
+                if (!control_ptr) {
+                    plugin->custom_controls.push_back({});
+                    control_ptr = &plugin->custom_controls.back();
+                }
+                control_ptr->action_id = msg->action_id;
+                control_ptr->expects_text = msg->expects_text != 0;
+                control_ptr->layout = msg->layout;
+                control_ptr->ui_width = msg->ui_width;
+                control_ptr->label = msg->label;
             }
         }
 
@@ -930,6 +1011,7 @@ int main(int, char* argv[]) {
 
                     if (!plugin.host_ui_detached) {
                         render_plugin_params(rack, plugin);
+                        render_plugin_custom_controls(rack, plugin);
                     }
                 }
 
@@ -938,6 +1020,7 @@ int main(int, char* argv[]) {
                     std::string detached_title = plugin.name + " GUI##detached_" + std::to_string(rack.id) + "_" + std::to_string(plugin.instance_id);
                     if (ImGui::Begin(detached_title.c_str(), &detached_open)) {
                         render_plugin_params(rack, plugin);
+                        render_plugin_custom_controls(rack, plugin);
                     }
                     ImGui::End();
                     if (!detached_open) {

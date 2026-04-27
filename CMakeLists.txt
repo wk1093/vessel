@@ -14,6 +14,7 @@ pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
 pkg_check_modules(SPA REQUIRED IMPORTED_TARGET libspa-0.2)
 pkg_check_modules(LILV REQUIRED IMPORTED_TARGET lilv-0)
 pkg_check_modules(SUIL REQUIRED IMPORTED_TARGET suil-0)
+pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile)
 
 # 2. ImGui (Docking Branch) via FetchContent
 include(FetchContent)
@@ -78,6 +79,7 @@ target_link_libraries(vessel-runner PRIVATE
     PkgConfig::SPA
     PkgConfig::LILV
     PkgConfig::SUIL
+    PkgConfig::SNDFILE
 )
 
 # --- Compiler Optimizations ---

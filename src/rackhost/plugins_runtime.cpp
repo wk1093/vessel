@@ -4,14 +4,19 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include <lilv/lilv.h>
 #include <lv2/core/lv2.h>
 #include <lv2/port-props/port-props.h>
 #include <lv2/ui/ui.h>
+#include <sndfile.h>
 #include <suil/suil.h>
 
 #include "plugins.h"
@@ -175,10 +180,13 @@ private:
 class SoundboardPlugin final : public RackPlugin {
 public:
     static constexpr uint32_t kPadCount = 4;
-    static constexpr uint32_t kSoundCount = 5;
 
     uint32_t type_id() const override { return kPluginTypeSoundboard; }
     const char* display_name() const override { return "Soundboard"; }
+
+    SoundboardPlugin() {
+        add_sound_slot();
+    }
 
     float process_sample(float in, float sample_rate, int channel) override {
         if (channel == 1) {
@@ -189,9 +197,13 @@ public:
         for (uint32_t pad = 0; pad < kPadCount; ++pad) {
             if (pad_trigger_[pad].exchange(false, std::memory_order_relaxed)) {
                 voices_[pad].active = true;
-                voices_[pad].sound = std::clamp(sound_select_[pad].load(std::memory_order_relaxed), 0, static_cast<int>(kSoundCount - 1));
-                voices_[pad].time = 0.0f;
-                voices_[pad].phase = 0.0f;
+                voices_[pad].sound_index = static_cast<size_t>(std::max(0, sound_select_[pad].load(std::memory_order_relaxed)));
+                voices_[pad].position = 0.0f;
+                if (voices_[pad].sound_index < sounds_.size() && sounds_[voices_[pad].sound_index].sample_rate > 0) {
+                    voices_[pad].step = static_cast<float>(sounds_[voices_[pad].sound_index].sample_rate) / sr;
+                } else {
+                    voices_[pad].step = 1.0f;
+                }
             }
         }
 
@@ -208,7 +220,43 @@ public:
 
     std::vector<PluginParamSpec> param_specs() const override {
         std::vector<PluginParamSpec> out;
-        out.reserve(1 + (kPadCount * 3));
+        const bool customize = customize_mode_.load(std::memory_order_relaxed);
+
+        out.push_back({
+            kParamCustomizeMode,
+            "Customize",
+            vessel::ParamWidget::TOGGLE,
+            0.0f,
+            1.0f,
+            1.0f,
+            vessel::ParamValueType::BOOL,
+            vessel::PARAM_FLAG_NONE,
+            {},
+            vessel::ParamLayoutHint::AUTO,
+            140.0f,
+        });
+
+        if (!customize) {
+            out.reserve(1 + kPadCount);
+            for (uint32_t pad = 0; pad < kPadCount; ++pad) {
+                out.push_back({
+                    pad_trigger_param_id(pad),
+                    kPadTriggerNames[pad],
+                    vessel::ParamWidget::BUTTON,
+                    0.0f,
+                    1.0f,
+                    0.0f,
+                    vessel::ParamValueType::BOOL,
+                    vessel::PARAM_FLAG_NONE,
+                    {},
+                    ((pad % 2) == 0) ? vessel::ParamLayoutHint::AUTO : vessel::ParamLayoutHint::SAME_LINE,
+                    140.0f,
+                });
+            }
+            return out;
+        }
+
+        out.reserve(3 + (kPadCount * 3));
 
         out.push_back({
             kParamMasterMix,
@@ -220,11 +268,26 @@ public:
             vessel::ParamValueType::FLOAT,
             vessel::PARAM_FLAG_NONE,
             {},
-            vessel::ParamLayoutHint::AUTO,
+            vessel::ParamLayoutHint::SAME_LINE,
+            0.0f,
+        });
+
+        out.push_back({
+            kParamAddSound,
+            "+ Add Sound",
+            vessel::ParamWidget::BUTTON,
+            0.0f,
+            1.0f,
+            0.0f,
+            vessel::ParamValueType::BOOL,
+            vessel::PARAM_FLAG_NONE,
+            {},
+            vessel::ParamLayoutHint::SAME_LINE,
             0.0f,
         });
 
         const auto options = sound_options();
+        const float max_sound_index = options.empty() ? 0.0f : static_cast<float>(options.size() - 1);
         for (uint32_t pad = 0; pad < kPadCount; ++pad) {
             out.push_back({
                 pad_trigger_param_id(pad),
@@ -244,8 +307,8 @@ public:
                 kPadSoundNames[pad],
                 vessel::ParamWidget::SLIDER,
                 0.0f,
-                static_cast<float>(kSoundCount - 1),
-                static_cast<float>(pad % kSoundCount),
+                max_sound_index,
+                static_cast<float>(std::min<size_t>(pad, options.empty() ? 0 : options.size() - 1)),
                 vessel::ParamValueType::ENUM,
                 vessel::PARAM_FLAG_NONE,
                 options,
@@ -271,8 +334,14 @@ public:
     }
 
     float get_param(uint32_t param_id) const override {
+        if (param_id == kParamCustomizeMode) {
+            return customize_mode_.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        }
         if (param_id == kParamMasterMix) {
             return master_mix_.load(std::memory_order_relaxed);
+        }
+        if (param_id == kParamAddSound) {
+            return 0.0f;
         }
 
         uint32_t pad = 0;
@@ -292,8 +361,25 @@ public:
     }
 
     void set_param(uint32_t param_id, float value) override {
+        if (param_id == kParamCustomizeMode) {
+            const bool customize = value > 0.5f;
+            const bool old = customize_mode_.load(std::memory_order_relaxed);
+            if (customize != old) {
+                customize_mode_.store(customize, std::memory_order_relaxed);
+                ++ui_schema_version_;
+            }
+            return;
+        }
+
         if (param_id == kParamMasterMix) {
             master_mix_.store(std::clamp(value, 0.0f, 1.0f), std::memory_order_relaxed);
+            return;
+        }
+
+        if (param_id == kParamAddSound) {
+            if (value > 0.5f) {
+                add_sound_slot();
+            }
             return;
         }
 
@@ -309,7 +395,8 @@ public:
             return;
         }
         if (param_id == pad_sound_param_id(pad)) {
-            const int sound = std::clamp(static_cast<int>(std::lround(value)), 0, static_cast<int>(kSoundCount - 1));
+            const int max_sound = static_cast<int>(sounds_.empty() ? 0 : sounds_.size() - 1);
+            const int sound = std::clamp(static_cast<int>(std::lround(value)), 0, max_sound);
             sound_select_[pad].store(sound, std::memory_order_relaxed);
             return;
         }
@@ -319,17 +406,74 @@ public:
         }
     }
 
+    std::vector<PluginCustomControlSpec> custom_controls() const override {
+        std::vector<PluginCustomControlSpec> out;
+        if (!customize_mode_.load(std::memory_order_relaxed)) {
+            return out;
+        }
+
+        out.reserve(sounds_.size() * 2);
+        for (size_t i = 0; i < sounds_.size(); ++i) {
+            out.push_back({
+                load_action_id(i),
+                std::string("Load File: ") + sounds_[i].label,
+                true,
+                vessel::ParamLayoutHint::AUTO,
+                320.0f,
+            });
+            if (sounds_.size() > 1) {
+                out.push_back({
+                    remove_action_id(i),
+                    std::string("Remove: ") + sounds_[i].label,
+                    false,
+                    vessel::ParamLayoutHint::SAME_LINE,
+                    0.0f,
+                });
+            }
+        }
+        return out;
+    }
+
+    void trigger_custom_action(uint32_t action_id) override {
+        if (action_id >= kActionRemoveBase && action_id < (kActionRemoveBase + 1000)) {
+            const size_t index = static_cast<size_t>(action_id - kActionRemoveBase);
+            remove_sound_slot(index);
+        }
+    }
+
+    void set_custom_text(uint32_t action_id, const std::string& text) override {
+        if (action_id >= kActionLoadBase && action_id < (kActionLoadBase + 1000)) {
+            const size_t index = static_cast<size_t>(action_id - kActionLoadBase);
+            load_sound_into_slot(index, text);
+        }
+    }
+
+    uint64_t ui_schema_version() const override {
+        return ui_schema_version_;
+    }
+
 private:
+    struct LoadedSound {
+        std::string label;
+        std::string path;
+        std::vector<float> samples;
+        uint32_t sample_rate = 48000;
+    };
+
     struct Voice {
         bool active = false;
-        int sound = 0;
-        float time = 0.0f;
-        float phase = 0.0f;
+        size_t sound_index = 0;
+        float position = 0.0f;
+        float step = 1.0f;
     };
 
     static constexpr uint32_t kParamMasterMix = 1;
-    static constexpr uint32_t kParamBase = 2;
+    static constexpr uint32_t kParamCustomizeMode = 2;
+    static constexpr uint32_t kParamAddSound = 3;
+    static constexpr uint32_t kParamBase = 100;
     static constexpr uint32_t kParamsPerPad = 3;
+    static constexpr uint32_t kActionLoadBase = 1000;
+    static constexpr uint32_t kActionRemoveBase = 2000;
 
     static constexpr const char* kPadTriggerNames[kPadCount] = {
         "Pad A Trigger",
@@ -352,14 +496,24 @@ private:
         "Pad D Gain",
     };
 
-    static std::vector<PluginParamEnumOption> sound_options() {
-        return {
-            {0, "Kick"},
-            {1, "Snare"},
-            {2, "Hi-Hat"},
-            {3, "Clap"},
-            {4, "Beep"},
-        };
+    static uint32_t load_action_id(size_t index) {
+        return kActionLoadBase + static_cast<uint32_t>(index);
+    }
+
+    static uint32_t remove_action_id(size_t index) {
+        return kActionRemoveBase + static_cast<uint32_t>(index);
+    }
+
+    std::vector<PluginParamEnumOption> sound_options() const {
+        std::vector<PluginParamEnumOption> out;
+        out.reserve(sounds_.size());
+        for (size_t i = 0; i < sounds_.size(); ++i) {
+            out.push_back({static_cast<int>(i), sounds_[i].label});
+        }
+        if (out.empty()) {
+            out.push_back({0, "(No Sounds)"});
+        }
+        return out;
     }
 
     static uint32_t pad_trigger_param_id(uint32_t pad) {
@@ -383,65 +537,158 @@ private:
         return pad_out < kPadCount;
     }
 
-    float next_noise() {
-        noise_state_ = noise_state_ * 1664525u + 1013904223u;
-        const uint32_t x = (noise_state_ >> 8) & 0x00FFFFFFu;
-        return (static_cast<float>(x) / 8388607.5f) - 1.0f;
+    static std::string slot_label(size_t idx) {
+        return "Sound " + std::to_string(idx + 1);
     }
 
-    float render_voice(Voice& v, float sample_rate) {
+    static std::string file_label_from_path(const std::string& path) {
+        const std::filesystem::path p(path);
+        const std::string stem = p.stem().string();
+        if (stem.empty()) {
+            return p.filename().string();
+        }
+        return stem;
+    }
+
+    bool decode_audio_file(const std::string& path, LoadedSound& out) {
+        SF_INFO info{};
+        SNDFILE* file = sf_open(path.c_str(), SFM_READ, &info);
+        if (!file) {
+            return false;
+        }
+
+        const sf_count_t max_frames = static_cast<sf_count_t>(info.samplerate) * 120;
+        const sf_count_t frames_to_read = std::max<sf_count_t>(0, std::min(info.frames, max_frames));
+        if (frames_to_read <= 0 || info.channels <= 0) {
+            sf_close(file);
+            return false;
+        }
+
+        std::vector<float> interleaved(static_cast<size_t>(frames_to_read) * static_cast<size_t>(info.channels));
+        const sf_count_t read_frames = sf_readf_float(file, interleaved.data(), frames_to_read);
+        sf_close(file);
+        if (read_frames <= 0) {
+            return false;
+        }
+
+        out.samples.resize(static_cast<size_t>(read_frames));
+        for (sf_count_t i = 0; i < read_frames; ++i) {
+            float sum = 0.0f;
+            for (int ch = 0; ch < info.channels; ++ch) {
+                sum += interleaved[static_cast<size_t>(i) * static_cast<size_t>(info.channels) + static_cast<size_t>(ch)];
+            }
+            out.samples[static_cast<size_t>(i)] = sum / static_cast<float>(info.channels);
+        }
+
+        out.sample_rate = static_cast<uint32_t>(std::max(info.samplerate, 1));
+        out.path = path;
+        out.label = file_label_from_path(path);
+        if (out.label.empty()) {
+            out.label = "Loaded Sound";
+        }
+
+        return true;
+    }
+
+    void add_sound_slot() {
+        LoadedSound slot;
+        slot.label = slot_label(sounds_.size());
+        slot.sample_rate = 48000;
+        sounds_.push_back(std::move(slot));
+        ++ui_schema_version_;
+    }
+
+    void remove_sound_slot(size_t index) {
+        if (sounds_.size() <= 1 || index >= sounds_.size()) {
+            return;
+        }
+
+        sounds_.erase(sounds_.begin() + static_cast<long>(index));
+
+        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
+            int selected = sound_select_[pad].load(std::memory_order_relaxed);
+            if (selected == static_cast<int>(index)) {
+                selected = std::max(0, selected - 1);
+            } else if (selected > static_cast<int>(index)) {
+                --selected;
+            }
+            selected = std::clamp(selected, 0, static_cast<int>(sounds_.size() - 1));
+            sound_select_[pad].store(selected, std::memory_order_relaxed);
+        }
+
+        for (auto& voice : voices_) {
+            if (!voice.active) {
+                continue;
+            }
+            if (voice.sound_index == index) {
+                voice.active = false;
+            } else if (voice.sound_index > index) {
+                --voice.sound_index;
+            }
+        }
+
+        ++ui_schema_version_;
+    }
+
+    void load_sound_into_slot(size_t index, const std::string& path) {
+        if (index >= sounds_.size() || path.empty()) {
+            return;
+        }
+
+        LoadedSound loaded;
+        if (!decode_audio_file(path, loaded)) {
+            return;
+        }
+
+        sounds_[index] = std::move(loaded);
+        ++ui_schema_version_;
+    }
+
+    float render_voice(Voice& v, float) {
         if (!v.active) {
             return 0.0f;
         }
 
-        const float dt = 1.0f / sample_rate;
-        const float t = v.time;
-        float sample = 0.0f;
-
-        if (v.sound == 0) {
-            const float env = std::exp(-8.0f * t);
-            const float freq = 40.0f + 120.0f * std::exp(-10.0f * t);
-            v.phase += (2.0f * 3.14159265358979323846f * freq) * dt;
-            sample = std::sin(v.phase) * env;
-            v.active = t < 0.7f;
-        } else if (v.sound == 1) {
-            const float env = std::exp(-14.0f * t);
-            v.phase += (2.0f * 3.14159265358979323846f * 200.0f) * dt;
-            sample = (next_noise() * 0.8f + std::sin(v.phase) * 0.2f) * env;
-            v.active = t < 0.45f;
-        } else if (v.sound == 2) {
-            const float env = std::exp(-38.0f * t);
-            sample = next_noise() * env;
-            v.active = t < 0.2f;
-        } else if (v.sound == 3) {
-            float env = 0.0f;
-            if (t < 0.03f) {
-                env = 1.0f - (t / 0.03f);
-            } else if (t < 0.06f) {
-                env = 1.0f - ((t - 0.03f) / 0.03f);
-            } else if (t < 0.10f) {
-                env = 1.0f - ((t - 0.06f) / 0.04f);
-            }
-            sample = next_noise() * env * 0.9f;
-            v.active = t < 0.12f;
-        } else {
-            const float env = std::exp(-6.0f * t);
-            v.phase += (2.0f * 3.14159265358979323846f * 880.0f) * dt;
-            sample = std::sin(v.phase) * env;
-            v.active = t < 0.7f;
+        if (v.sound_index >= sounds_.size()) {
+            v.active = false;
+            return 0.0f;
         }
 
-        v.time += dt;
+        const LoadedSound& sound = sounds_[v.sound_index];
+        if (sound.samples.empty()) {
+            v.active = false;
+            return 0.0f;
+        }
+
+        const size_t i0 = static_cast<size_t>(v.position);
+        if (i0 >= sound.samples.size()) {
+            v.active = false;
+            return 0.0f;
+        }
+
+        const size_t i1 = std::min(i0 + 1, sound.samples.size() - 1);
+        const float frac = v.position - static_cast<float>(i0);
+        const float s0 = sound.samples[i0];
+        const float s1 = sound.samples[i1];
+        const float sample = s0 + (s1 - s0) * frac;
+
+        v.position += std::max(0.0001f, v.step);
+        if (v.position >= static_cast<float>(sound.samples.size())) {
+            v.active = false;
+        }
+
         return sample;
     }
 
     std::atomic<float> master_mix_{0.8f};
-    std::array<std::atomic<int>, kPadCount> sound_select_{{0, 1, 2, 4}};
+    std::atomic<bool> customize_mode_{true};
+    std::array<std::atomic<int>, kPadCount> sound_select_{{0, 0, 0, 0}};
     std::array<std::atomic<float>, kPadCount> pad_gain_{{0.75f, 0.75f, 0.65f, 0.75f}};
     std::array<std::atomic<bool>, kPadCount> pad_trigger_{{false, false, false, false}};
 
+    std::vector<LoadedSound> sounds_;
     std::array<Voice, kPadCount> voices_{};
-    uint32_t noise_state_ = 0x6A09E667u;
+    uint64_t ui_schema_version_ = 1;
     float last_frame_out_ = 0.0f;
 };
 

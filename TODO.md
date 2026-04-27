@@ -5,7 +5,7 @@
 - [x] Add support for more plugin GUI elements for custom plugins (e.g. knobs, buttons, file selectors, etc.)
 - [x] Create customizable soundboard plugin.
 - [ ] Add LV2 ui inside of an imgui window instead of a separate window.
-- [ ] Make audio more stable and support more sample rates, buffer sizes, and channel configurations (e.g. mono, stereo, etc).
+- [ ] Make audio more stable (there is occasional glitching in helvum, or cracking if the input source isn't currently playing something) and support more sample rates, buffer sizes, and channel configurations (e.g. mono, stereo, etc).
 - [ ] Add support for LV2 state saving and loading.
 - [x] Add support for saving entire rack to a file and loading it back (all plugins and their states).
 - [ ] Add support for MIDI input and output (e.g. for controlling plugins with MIDI controllers or sending MIDI messages to other software).
