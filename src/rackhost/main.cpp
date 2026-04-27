@@ -32,9 +32,6 @@
 namespace {
 std::atomic<bool> g_running{true};
 
-void runner_log(const std::string& msg) {
-    std::cerr << "[vessel-runner] " << msg << std::endl;
-}
 
 struct AudioState {
     std::atomic<float> volume{1.0f};

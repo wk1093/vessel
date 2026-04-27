@@ -18,8 +18,20 @@
 #include <lv2/ui/ui.h>
 #include <sndfile.h>
 #include <suil/suil.h>
+#include <iostream>
+#include <cstdarg>
 
 #include "plugins.h"
+
+
+void runner_log(const std::string& msg, ...) {
+    std::cerr << "[vessel-runner] ";
+    va_list args;
+    va_start(args, msg);
+    vfprintf(stderr, msg.c_str(), args);
+    va_end(args);
+    std::cerr << std::endl;
+}
 
 namespace {
 
@@ -1274,6 +1286,7 @@ bool plugin_is_supported(uint32_t plugin_type_id) {
 }
 
 std::vector<DiscoveredLv2Plugin> scan_lv2_plugins() {
+    runner_log("Scanning for LV2 plugins...");
     std::vector<DiscoveredLv2Plugin> out;
 
     LilvWorld* world = lilv_world_new();
@@ -1314,6 +1327,7 @@ std::vector<DiscoveredLv2Plugin> scan_lv2_plugins() {
         }
 
         if (!has_audio_in || !has_audio_out) {
+            runner_log("Skipping LV2 plugin without audio ports: %s", lilv_node_as_string(lilv_plugin_get_uri(plugin)));
             continue;
         }
 
@@ -1322,6 +1336,7 @@ std::vector<DiscoveredLv2Plugin> scan_lv2_plugins() {
         const char* uri = uri_node ? lilv_node_as_string(uri_node) : nullptr;
         const char* name = name_node ? lilv_node_as_string(name_node) : nullptr;
         if (!uri || !name) {
+            runner_log("Skipping LV2 plugin with invalid URI or name");
             continue;
         }
 
@@ -1330,6 +1345,8 @@ std::vector<DiscoveredLv2Plugin> scan_lv2_plugins() {
         if (uis && lilv_uis_size(uis) > 0) {
             has_ui = true;
         }
+
+        runner_log("Found LV2 plugin: %s (%s)", name, uri);
 
         out.push_back({next_type_id++, name, uri, has_ui});
     }

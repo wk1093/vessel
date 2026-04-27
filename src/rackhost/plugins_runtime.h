@@ -8,6 +8,8 @@
 
 #include "protocol.h"
 
+void runner_log(const std::string& msg, ...);
+
 struct PluginParamEnumOption {
     int value;
     std::string label;
