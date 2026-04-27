@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cerrno>
 #include <csignal>
@@ -131,6 +132,69 @@ std::string get_runner_binary_path(const char* argv0) {
     }
 
     return (exe_path.parent_path() / "vessel-runner").string();
+}
+
+std::string shell_escape_single_quotes(const std::string& input) {
+    std::string out;
+    out.reserve(input.size() + 8);
+    for (const char c : input) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+bool run_pick_command(const std::string& cmd, std::string& out_path) {
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        return false;
+    }
+
+    std::array<char, 512> buf{};
+    std::string result;
+    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
+        result += buf.data();
+    }
+
+    const int status = pclose(pipe);
+    if (status != 0) {
+        return false;
+    }
+
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+        result.pop_back();
+    }
+    if (result.empty()) {
+        return false;
+    }
+
+    out_path = result;
+    return true;
+}
+
+bool open_file_picker(bool save_mode, const char* title, const std::string& current_path, std::string& out_path) {
+    const std::string esc_title = shell_escape_single_quotes(title ? title : "Select File");
+    const std::string esc_current = shell_escape_single_quotes(current_path);
+
+    std::string cmd;
+    if (save_mode) {
+        cmd = "zenity --file-selection --save --confirm-overwrite --title='" + esc_title + "' --filename='" + esc_current + "' 2>/dev/null";
+    } else {
+        cmd = "zenity --file-selection --title='" + esc_title + "' --filename='" + esc_current + "' 2>/dev/null";
+    }
+    if (run_pick_command(cmd, out_path)) {
+        return true;
+    }
+
+    if (save_mode) {
+        cmd = "kdialog --getsavefilename '" + esc_current + "' --title '" + esc_title + "' 2>/dev/null";
+    } else {
+        cmd = "kdialog --getopenfilename '" + esc_current + "' --title '" + esc_title + "' 2>/dev/null";
+    }
+    return run_pick_command(cmd, out_path);
 }
 
 void try_connect_socket(Rack& rack) {
@@ -684,6 +748,23 @@ int main(int, char* argv[]) {
                     plugin.name.c_str(),
                     ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
 
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
+                    const uint32_t dragged_instance_id = plugin.instance_id;
+                    ImGui::SetDragDropPayload("VESSEL_PLUGIN", &dragged_instance_id, sizeof(dragged_instance_id));
+                    ImGui::Text("Move: %s", plugin.name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("VESSEL_PLUGIN")) {
+                        if (payload->DataSize == static_cast<int>(sizeof(uint32_t))) {
+                            pending_move_instance = *static_cast<const uint32_t*>(payload->Data);
+                            pending_move_target_index = plugin_index;
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+
                 const float remove_button_width = ImGui::GetFrameHeight();
                 const float button_spacing = ImGui::GetStyle().ItemSpacing.x;
                 const char* ui_button_label = plugin.is_open ? "Close GUI" : "Open GUI";
@@ -711,23 +792,6 @@ int main(int, char* argv[]) {
                     msg.instance_id = plugin.instance_id;
                     send_ipc(rack, msg);
                     remove_requested = true;
-                }
-
-                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
-                    const uint32_t dragged_instance_id = plugin.instance_id;
-                    ImGui::SetDragDropPayload("VESSEL_PLUGIN", &dragged_instance_id, sizeof(dragged_instance_id));
-                    ImGui::Text("Move: %s", plugin.name.c_str());
-                    ImGui::EndDragDropSource();
-                }
-
-                if (ImGui::BeginDragDropTarget()) {
-                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("VESSEL_PLUGIN")) {
-                        if (payload->DataSize == static_cast<int>(sizeof(uint32_t))) {
-                            pending_move_instance = *static_cast<const uint32_t*>(payload->Data);
-                            pending_move_target_index = plugin_index;
-                        }
-                    }
-                    ImGui::EndDragDropTarget();
                 }
 
                 if (header_open) {
@@ -924,6 +988,14 @@ int main(int, char* argv[]) {
             ImGui::TextUnformatted("Path:");
             ImGui::SetNextItemWidth(420.0f);
             ImGui::InputText("##save_rack_path", rack_file_buf, sizeof(rack_file_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            if (ImGui::Button("Browse##save_rack")) {
+                std::string chosen;
+                if (open_file_picker(true, "Save Rack", rack_file_buf, chosen)) {
+                    std::strncpy(rack_file_buf, chosen.c_str(), vessel::kMaxFilePathLen);
+                    rack_file_buf[vessel::kMaxFilePathLen] = '\0';
+                }
+            }
             ImGui::Separator();
 
             if (ImGui::Button("Save", ImVec2(120, 0))) {
@@ -953,6 +1025,14 @@ int main(int, char* argv[]) {
             ImGui::TextUnformatted("Path:");
             ImGui::SetNextItemWidth(420.0f);
             ImGui::InputText("##load_rack_path", rack_file_buf, sizeof(rack_file_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            if (ImGui::Button("Browse##load_rack")) {
+                std::string chosen;
+                if (open_file_picker(false, "Load Rack", rack_file_buf, chosen)) {
+                    std::strncpy(rack_file_buf, chosen.c_str(), vessel::kMaxFilePathLen);
+                    rack_file_buf[vessel::kMaxFilePathLen] = '\0';
+                }
+            }
             ImGui::Separator();
 
             if (ImGui::Button("Load", ImVec2(120, 0))) {
@@ -982,6 +1062,14 @@ int main(int, char* argv[]) {
             ImGui::TextUnformatted("Path:");
             ImGui::SetNextItemWidth(420.0f);
             ImGui::InputText("##save_preset_path", preset_file_buf, sizeof(preset_file_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            if (ImGui::Button("Browse##save_preset")) {
+                std::string chosen;
+                if (open_file_picker(true, "Save Preset", preset_file_buf, chosen)) {
+                    std::strncpy(preset_file_buf, chosen.c_str(), vessel::kMaxFilePathLen);
+                    preset_file_buf[vessel::kMaxFilePathLen] = '\0';
+                }
+            }
             ImGui::Separator();
 
             if (ImGui::Button("Save", ImVec2(120, 0))) {
@@ -1014,6 +1102,14 @@ int main(int, char* argv[]) {
             ImGui::TextUnformatted("Path:");
             ImGui::SetNextItemWidth(420.0f);
             ImGui::InputText("##load_preset_path", preset_file_buf, sizeof(preset_file_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            if (ImGui::Button("Browse##load_preset")) {
+                std::string chosen;
+                if (open_file_picker(false, "Load Preset", preset_file_buf, chosen)) {
+                    std::strncpy(preset_file_buf, chosen.c_str(), vessel::kMaxFilePathLen);
+                    preset_file_buf[vessel::kMaxFilePathLen] = '\0';
+                }
+            }
             ImGui::Separator();
 
             if (ImGui::Button("Load", ImVec2(120, 0))) {

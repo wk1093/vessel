@@ -12,6 +12,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -47,7 +48,7 @@ struct PluginInstance {
 };
 
 struct SavedPluginState {
-    uint32_t plugin_type_id = 0;
+    std::string plugin_id;
     bool bypassed = false;
     std::vector<std::pair<uint32_t, float>> params;
 };
@@ -137,6 +138,84 @@ const DiscoveredLv2Plugin* find_lv2_plugin(const RunnerRack& rack, uint32_t plug
         }
     }
     return nullptr;
+}
+
+const DiscoveredLv2Plugin* find_lv2_plugin_by_uri(const RunnerRack& rack, const std::string& uri) {
+    for (const auto& entry : rack.lv2_plugins) {
+        if (entry.uri == uri) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+std::string plugin_identity_for_instance(const RunnerRack& rack, const PluginInstance& instance) {
+    if (!instance.plugin) {
+        return "";
+    }
+
+    const uint32_t type_id = instance.plugin->type_id();
+    const vessel::PluginManifestEntry* manifest = vessel::find_plugin_manifest_entry(type_id);
+    if (manifest && manifest->is_builtin) {
+        return "builtin:" + std::to_string(type_id);
+    }
+
+    const DiscoveredLv2Plugin* lv2 = find_lv2_plugin(rack, type_id);
+    if (lv2 && !lv2->uri.empty()) {
+        return "lv2:" + lv2->uri;
+    }
+
+    return "builtin:" + std::to_string(type_id);
+}
+
+bool resolve_plugin_type_id(const RunnerRack& rack, const std::string& plugin_id, uint32_t& out_type_id) {
+    if (plugin_id.empty()) {
+        return false;
+    }
+
+    const std::string_view id(plugin_id);
+    if (id.rfind("builtin:", 0) == 0) {
+        const std::string value(plugin_id.substr(8));
+        try {
+            out_type_id = static_cast<uint32_t>(std::stoul(value));
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    if (id.rfind("lv2:", 0) == 0) {
+        const std::string uri(plugin_id.substr(4));
+        const DiscoveredLv2Plugin* lv2 = find_lv2_plugin_by_uri(rack, uri);
+        if (!lv2) {
+            return false;
+        }
+        out_type_id = lv2->plugin_type_id;
+        return true;
+    }
+
+    bool all_digits = true;
+    for (const char c : plugin_id) {
+        if (c < '0' || c > '9') {
+            all_digits = false;
+            break;
+        }
+    }
+    if (all_digits) {
+        try {
+            out_type_id = static_cast<uint32_t>(std::stoul(plugin_id));
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    const DiscoveredLv2Plugin* lv2 = find_lv2_plugin_by_uri(rack, plugin_id);
+    if (!lv2) {
+        return false;
+    }
+    out_type_id = lv2->plugin_type_id;
+    return true;
 }
 
 template <typename T>
@@ -254,9 +333,9 @@ bool save_rack_to_file(const RunnerRack& rack, const std::string& path) {
     out << "plugin_count " << rack.plugins.size() << "\n";
 
     for (const auto& instance : rack.plugins) {
-        const uint32_t plugin_type_id = instance.plugin ? instance.plugin->type_id() : 0;
+        const std::string plugin_id = plugin_identity_for_instance(rack, instance);
         const std::vector<PluginParamSpec> specs = instance.plugin ? instance.plugin->param_specs() : std::vector<PluginParamSpec>{};
-        out << "plugin " << plugin_type_id << " " << (instance.bypassed ? 1 : 0) << " " << specs.size() << "\n";
+        out << "plugin " << plugin_id << " " << (instance.bypassed ? 1 : 0) << " " << specs.size() << "\n";
         for (const auto& spec : specs) {
             const float value = instance.plugin->get_param(spec.id);
             out << "param " << spec.id << " " << value << "\n";
@@ -305,10 +384,12 @@ bool load_rack_from_file(const std::string& path, SavedRackState& out_state) {
         int plugin_bypassed = 0;
         size_t param_count = 0;
 
-        in >> key >> plugin.plugin_type_id >> plugin_bypassed >> param_count;
+        std::string plugin_token;
+        in >> key >> plugin_token >> plugin_bypassed >> param_count;
         if (!in.good() || key != "plugin") {
             return false;
         }
+        plugin.plugin_id = plugin_token;
         plugin.bypassed = plugin_bypassed != 0;
 
         plugin.params.reserve(param_count);
@@ -328,7 +409,7 @@ bool load_rack_from_file(const std::string& path, SavedRackState& out_state) {
     return true;
 }
 
-bool save_plugin_preset_to_file(const PluginInstance& instance, const std::string& path) {
+bool save_plugin_preset_to_file(const RunnerRack& rack, const PluginInstance& instance, const std::string& path) {
     if (!instance.plugin || path.empty()) {
         return false;
     }
@@ -348,8 +429,9 @@ bool save_plugin_preset_to_file(const PluginInstance& instance, const std::strin
     }
 
     const std::vector<PluginParamSpec> specs = instance.plugin->param_specs();
+    const std::string plugin_id = plugin_identity_for_instance(rack, instance);
     out << "VSPT1\n";
-    out << "plugin_type_id " << instance.plugin->type_id() << "\n";
+    out << "plugin_id " << plugin_id << "\n";
     out << "param_count " << specs.size() << "\n";
     for (const auto& spec : specs) {
         const float value = instance.plugin->get_param(spec.id);
@@ -359,7 +441,7 @@ bool save_plugin_preset_to_file(const PluginInstance& instance, const std::strin
     return out.good();
 }
 
-bool load_plugin_preset_from_file(const std::string& path, uint32_t& plugin_type_id_out, std::vector<std::pair<uint32_t, float>>& params_out) {
+bool load_plugin_preset_from_file(const std::string& path, std::string& plugin_id_out, std::vector<std::pair<uint32_t, float>>& params_out) {
     std::ifstream in(path);
     if (!in.is_open()) {
         return false;
@@ -372,8 +454,20 @@ bool load_plugin_preset_from_file(const std::string& path, uint32_t& plugin_type
     }
 
     std::string key;
-    in >> key >> plugin_type_id_out;
-    if (!in.good() || key != "plugin_type_id") {
+    in >> key;
+    if (!in.good()) {
+        return false;
+    }
+    if (key == "plugin_id") {
+        in >> plugin_id_out;
+    } else if (key == "plugin_type_id") {
+        uint32_t legacy_type_id = 0;
+        in >> legacy_type_id;
+        plugin_id_out = std::to_string(legacy_type_id);
+    } else {
+        return false;
+    }
+    if (!in.good()) {
         return false;
     }
 
@@ -759,9 +853,14 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
             rack.plugins.clear();
 
             for (const auto& saved : state.plugins) {
-                std::unique_ptr<RackPlugin> plugin = create_plugin(saved.plugin_type_id);
+                uint32_t resolved_type_id = 0;
+                if (!resolve_plugin_type_id(rack, saved.plugin_id, resolved_type_id)) {
+                    continue;
+                }
+
+                std::unique_ptr<RackPlugin> plugin = create_plugin(resolved_type_id);
                 if (!plugin) {
-                    const DiscoveredLv2Plugin* lv2 = find_lv2_plugin(rack, saved.plugin_type_id);
+                    const DiscoveredLv2Plugin* lv2 = find_lv2_plugin(rack, resolved_type_id);
                     if (lv2) {
                         plugin = create_lv2_plugin(*lv2);
                     }
@@ -797,23 +896,25 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
             pw_thread_loop_lock(thread_loop);
             PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
             if (instance) {
-                save_plugin_preset_to_file(*instance, path);
+                save_plugin_preset_to_file(rack, *instance, path);
             }
             pw_thread_loop_unlock(thread_loop);
         } else if (hdr->type == vessel::MsgType::LOAD_PLUGIN_PRESET && frame_size == sizeof(vessel::MsgLoadPluginPreset)) {
             const auto* msg = reinterpret_cast<const vessel::MsgLoadPluginPreset*>(frame);
             const std::string path = cstr_from_fixed(msg->path, vessel::kMaxFilePathLen);
 
-            uint32_t preset_type_id = 0;
+            std::string preset_plugin_id;
             std::vector<std::pair<uint32_t, float>> params;
-            if (!load_plugin_preset_from_file(path, preset_type_id, params)) {
+            if (!load_plugin_preset_from_file(path, preset_plugin_id, params)) {
                 rack.rx_buffer.erase(rack.rx_buffer.begin(), rack.rx_buffer.begin() + static_cast<long>(frame_size));
                 continue;
             }
 
             pw_thread_loop_lock(thread_loop);
             PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
-            if (instance && instance->plugin && instance->plugin->type_id() == preset_type_id) {
+            uint32_t preset_type_id = 0;
+            const bool resolved = resolve_plugin_type_id(rack, preset_plugin_id, preset_type_id);
+            if (instance && instance->plugin && resolved && instance->plugin->type_id() == preset_type_id) {
                 for (const auto& param : params) {
                     instance->plugin->set_param(param.first, param.second);
                 }
