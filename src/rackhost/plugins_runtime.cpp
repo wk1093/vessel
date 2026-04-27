@@ -908,6 +908,11 @@ public:
             return;
         }
 
+        fallback_port_values_l_.assign(num_ports, 0.0f);
+        fallback_port_values_r_.assign(num_ports, 0.0f);
+        std::vector<uint8_t> port_connected_l(num_ports, 0);
+        std::vector<uint8_t> port_connected_r(num_ports, 0);
+
         control_values_l_.resize(controls_.size(), 0.0f);
         control_values_r_.resize(controls_.size(), 0.0f);
         for (size_t i = 0; i < controls_.size(); ++i) {
@@ -915,12 +920,28 @@ public:
             control_values_r_[i] = controls_[i].value;
             lilv_instance_connect_port(instance_l_, controls_[i].port_index, &control_values_l_[i]);
             lilv_instance_connect_port(instance_r_, controls_[i].port_index, &control_values_r_[i]);
+            port_connected_l[controls_[i].port_index] = 1;
+            port_connected_r[controls_[i].port_index] = 1;
         }
 
         lilv_instance_connect_port(instance_l_, audio_in_port_, &in_l_);
         lilv_instance_connect_port(instance_l_, audio_out_port_, &out_l_);
         lilv_instance_connect_port(instance_r_, audio_in_port_, &in_r_);
         lilv_instance_connect_port(instance_r_, audio_out_port_, &out_r_);
+        port_connected_l[audio_in_port_] = 1;
+        port_connected_l[audio_out_port_] = 1;
+        port_connected_r[audio_in_port_] = 1;
+        port_connected_r[audio_out_port_] = 1;
+
+        // Some LV2 plugins dereference every declared port during run(); ensure all ports are wired.
+        for (uint32_t i = 0; i < num_ports; ++i) {
+            if (!port_connected_l[i]) {
+                lilv_instance_connect_port(instance_l_, i, &fallback_port_values_l_[i]);
+            }
+            if (!port_connected_r[i]) {
+                lilv_instance_connect_port(instance_r_, i, &fallback_port_values_r_[i]);
+            }
+        }
 
         lilv_instance_activate(instance_l_);
         lilv_instance_activate(instance_r_);
@@ -1222,6 +1243,8 @@ private:
     std::vector<ControlParam> controls_;
     std::vector<float> control_values_l_;
     std::vector<float> control_values_r_;
+    std::vector<float> fallback_port_values_l_;
+    std::vector<float> fallback_port_values_r_;
 };
 
 }  // namespace

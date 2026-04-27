@@ -106,6 +106,15 @@ pid_t spawn_runner(const std::string& runner_binary, uint32_t id) {
     pid_t pid = fork();
     if (pid == 0) {
         const std::string id_str = std::to_string(id);
+        // execl(runner_binary.c_str(), runner_binary.c_str(), "--id", id_str.c_str(), nullptr);
+        // log to file like vessel-runner-<ID>.log in the same directory as the runner binary
+        const std::string log_path = std::filesystem::path(runner_binary).parent_path() / ("vessel-runner-" + id_str + ".log");
+        int log_fd = open(log_path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644);
+        if (log_fd >= 0) {
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        }
         execl(runner_binary.c_str(), runner_binary.c_str(), "--id", id_str.c_str(), nullptr);
         _exit(127);
     }
@@ -703,6 +712,82 @@ bool draw_knob(const char* label, float* value, float min_value, float max_value
     return changed;
 }
 
+void apply_dark_theme() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec4* colors = style.Colors;
+
+    // Windows & general
+    colors[ImGuiCol_WindowBg] = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.10f, 0.12f, 0.95f);
+
+    // Borders & lines
+    colors[ImGuiCol_Border] = ImVec4(0.25f, 0.25f, 0.27f, 1.00f);
+    colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.20f, 0.20f, 0.22f, 1.00f);
+
+    // Text
+    colors[ImGuiCol_Text] = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
+
+    // Buttons & controls
+    colors[ImGuiCol_Button] = ImVec4(0.20f, 0.20f, 0.22f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.30f, 0.33f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.15f, 0.50f, 0.80f, 1.00f);
+
+    // Sliders & drags
+    colors[ImGuiCol_FrameBg] = ImVec4(0.16f, 0.16f, 0.18f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.20f, 0.20f, 0.22f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.15f, 0.50f, 0.80f, 0.50f);
+
+    // Sliders
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.35f, 0.35f, 0.37f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.15f, 0.50f, 0.80f, 1.00f);
+
+    // Headers & tabs
+    colors[ImGuiCol_Header] = ImVec4(0.15f, 0.50f, 0.80f, 0.31f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.15f, 0.50f, 0.80f, 0.50f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.15f, 0.50f, 0.80f, 1.00f);
+    colors[ImGuiCol_Tab] = ImVec4(0.16f, 0.16f, 0.18f, 1.00f);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.20f, 0.20f, 0.22f, 1.00f);
+    colors[ImGuiCol_TabActive] = ImVec4(0.15f, 0.50f, 0.80f, 1.00f);
+    colors[ImGuiCol_TabUnfocused] = ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
+    colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.16f, 0.16f, 0.18f, 1.00f);
+
+    // Checkboxes & radios
+    colors[ImGuiCol_CheckMark] = ImVec4(0.15f, 0.50f, 0.80f, 1.00f);
+
+    // Selection
+    colors[ImGuiCol_PlotLines] = ImVec4(0.15f, 0.50f, 0.80f, 1.00f);
+    colors[ImGuiCol_PlotLinesHovered] = ImVec4(0.25f, 0.60f, 0.90f, 1.00f);
+    colors[ImGuiCol_PlotHistogram] = ImVec4(0.15f, 0.50f, 0.80f, 1.00f);
+    colors[ImGuiCol_PlotHistogramHovered] = ImVec4(0.25f, 0.60f, 0.90f, 1.00f);
+
+    // Drag drop
+    colors[ImGuiCol_DragDropTarget] = ImVec4(0.15f, 0.50f, 0.80f, 0.90f);
+
+    // Navigation
+    colors[ImGuiCol_NavCursor] = ImVec4(0.15f, 0.50f, 0.80f, 1.00f);
+    colors[ImGuiCol_NavWindowingHighlight] = ImVec4(0.15f, 0.50f, 0.80f, 0.70f);
+
+    // Scrollbar
+    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.25f, 0.25f, 0.27f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.35f, 0.35f, 0.37f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.15f, 0.50f, 0.80f, 1.00f);
+
+    // Style adjustments
+    style.FramePadding = ImVec2(4.0f, 3.0f);
+    style.FrameRounding = 4.0f;
+    style.WindowRounding = 4.0f;
+    style.PopupRounding = 4.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.GrabRounding = 3.0f;
+    style.TabRounding = 3.0f;
+    style.WindowBorderSize = 1.0f;
+    style.FrameBorderSize = 0.0f;
+}
+
 int main(int, char* argv[]) {
     const std::string runner_binary = get_runner_binary_path(argv[0]);
 
@@ -732,6 +817,9 @@ int main(int, char* argv[]) {
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
+
+    // Apply dark theme
+    apply_dark_theme();
 
     std::vector<std::unique_ptr<Rack>> racks;
     uint32_t next_rack_id = 1;
@@ -835,6 +923,9 @@ int main(int, char* argv[]) {
                 msg.gain = rack.master_gain;
                 send_ipc(rack, msg);
             }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("Overall volume amplification for the entire rack (0.0 - 2.0x)");
+            }
 
             bool bypassed = rack.bypassed_ui;
             if (ImGui::Checkbox("Bypass", &bypassed)) {
@@ -842,6 +933,9 @@ int main(int, char* argv[]) {
                 vessel::MsgSetBypass msg;
                 msg.bypassed = bypassed ? 1 : 0;
                 send_ipc(rack, msg);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("Bypass all plugins and pass audio through unchanged");
             }
 
             draw_level_meter("In", rack.in_peak);
@@ -856,12 +950,18 @@ int main(int, char* argv[]) {
                 }
                 rack.open_plugin_browser = true;
             }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("Add a built-in plugin to the rack");
+            }
             ImGui::SameLine();
             if (ImGui::Button("+ Add LV2 Plugin")) {
                 rack.available_lv2_plugins.clear();
                 vessel::MsgReqLv2Catalog msg;
                 send_ipc(rack, msg);
                 rack.open_lv2_browser = true;
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("Add an LV2 plugin from your system");
             }
 
             std::string popup_name = "Plugin Browser##" + std::to_string(rack.id);
@@ -994,6 +1094,9 @@ int main(int, char* argv[]) {
                             plugin.host_ui_detached = !plugin.host_ui_detached;
                         }
                     }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Open or close the plugin's graphical user interface");
+                    }
                 }
 
                 const float remove_button_x = right_edge - remove_button_width;
@@ -1006,6 +1109,9 @@ int main(int, char* argv[]) {
                     send_ipc(rack, msg);
                     remove_requested = true;
                 }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                    ImGui::SetTooltip("Remove this plugin from the rack");
+                }
 
                 if (header_open) {
                     if (ImGui::Button("Save Preset")) {
@@ -1014,12 +1120,18 @@ int main(int, char* argv[]) {
                         plugin_for_preset_action = plugin.instance_id;
                         std::snprintf(preset_file_buf, sizeof(preset_file_buf), "preset-%u.vsp", plugin.instance_id);
                     }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Save the current plugin settings to a preset file");
+                    }
                     ImGui::SameLine();
                     if (ImGui::Button("Load Preset")) {
                         show_load_preset = true;
                         rack_for_preset_action = r;
                         plugin_for_preset_action = plugin.instance_id;
                         std::snprintf(preset_file_buf, sizeof(preset_file_buf), "preset-%u.vsp", plugin.instance_id);
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Load plugin settings from a previously saved preset file");
                     }
 
                     if (!plugin.host_ui_detached) {

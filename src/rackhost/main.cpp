@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -30,6 +31,10 @@
 
 namespace {
 std::atomic<bool> g_running{true};
+
+void runner_log(const std::string& msg) {
+    std::cerr << "[vessel-runner] " << msg << std::endl;
+}
 
 struct AudioState {
     std::atomic<float> volume{1.0f};
@@ -69,6 +74,7 @@ struct RunnerRack {
 
     AudioState audio_state;
     std::vector<PluginInstance> plugins;
+    std::mutex plugins_mutex;
     std::vector<DiscoveredLv2Plugin> lv2_plugins;
     uint32_t next_plugin_instance_id = 1;
 
@@ -665,7 +671,7 @@ static void on_process(void* data, struct spa_io_position* position) {
         }
 
         auto& d_in = b_in->buffer->datas[0];
-        const float* in = static_cast<float*>(d_in.data);
+        const float* in = static_cast<const float*>(d_in.data);
         float* out = static_cast<float*>(d_out.data);
         const uint32_t n_samples = d_in.chunk->size / sizeof(float);
 
@@ -677,9 +683,12 @@ static void on_process(void* data, struct spa_io_position* position) {
                 s *= vol;
             }
 
-            for (auto& instance : rack->plugins) {
-                if (!instance.bypassed) {
-                    s = instance.plugin->process_sample(s, sample_rate, ch);
+            {
+                std::lock_guard<std::mutex> lock(rack->plugins_mutex);
+                for (auto& instance : rack->plugins) {
+                    if (!instance.bypassed) {
+                        s = instance.plugin->process_sample(s, sample_rate, ch);
+                    }
                 }
             }
 
@@ -828,10 +837,12 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
             send_lv2_catalog(rack, client_fd);
         } else if (hdr->type == vessel::MsgType::ADD_PLUGIN && frame_size == sizeof(vessel::MsgAddPlugin)) {
             const auto* msg = reinterpret_cast<const vessel::MsgAddPlugin*>(frame);
+            runner_log("ADD_PLUGIN request type_id=" + std::to_string(msg->plugin_type_id));
             std::unique_ptr<RackPlugin> plugin = create_plugin(msg->plugin_type_id);
             if (!plugin) {
                 const DiscoveredLv2Plugin* lv2 = find_lv2_plugin(rack, msg->plugin_type_id);
                 if (lv2) {
+                    runner_log("ADD_PLUGIN using LV2 plugin: " + lv2->name);
                     plugin = create_lv2_plugin(*lv2);
                 }
             }
@@ -839,54 +850,71 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                 const uint32_t instance_id = rack.next_plugin_instance_id++;
 
                 pw_thread_loop_lock(thread_loop);
-                PluginInstance new_instance;
-                new_instance.instance_id = instance_id;
-                new_instance.bypassed = false;
-                new_instance.plugin = std::move(plugin);
-                rack.plugins.push_back(std::move(new_instance));
-                PluginInstance* added_instance = find_plugin_instance(rack, instance_id);
-                if (added_instance && added_instance->plugin) {
-                    refresh_plugin_param_cache(*added_instance);
-                    added_instance->custom_ui_open = false;
-                    send_plugin_instance_state(client_fd, *added_instance);
+                {
+                    std::lock_guard<std::mutex> lock(rack.plugins_mutex);
+                    PluginInstance new_instance;
+                    new_instance.instance_id = instance_id;
+                    new_instance.bypassed = false;
+                    new_instance.plugin = std::move(plugin);
+                    rack.plugins.push_back(std::move(new_instance));
+
+                    PluginInstance* added_instance = find_plugin_instance(rack, instance_id);
+                    if (added_instance && added_instance->plugin) {
+                        runner_log("ADD_PLUGIN success instance_id=" + std::to_string(instance_id));
+                        refresh_plugin_param_cache(*added_instance);
+                        added_instance->custom_ui_open = false;
+                        send_plugin_instance_state(client_fd, *added_instance);
+                    }
                 }
                 pw_thread_loop_unlock(thread_loop);
+            } else {
+                runner_log("ADD_PLUGIN failed for type_id=" + std::to_string(msg->plugin_type_id));
             }
         } else if (hdr->type == vessel::MsgType::REQ_PLUGIN_PARAMS && frame_size == sizeof(vessel::MsgReqPluginParams)) {
             const auto* msg = reinterpret_cast<const vessel::MsgReqPluginParams*>(frame);
             pw_thread_loop_lock(thread_loop);
-            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
-            if (instance && instance->plugin) {
-                send_plugin_params_reset(client_fd, msg->instance_id);
-                send_plugin_params(client_fd, msg->instance_id, *instance->plugin);
-                send_plugin_custom_controls(client_fd, msg->instance_id, *instance->plugin);
-            }
-            pw_thread_loop_unlock(thread_loop);
-        } else if (hdr->type == vessel::MsgType::SET_PLUGIN_PARAM && frame_size == sizeof(vessel::MsgSetPluginParam)) {
-            const auto* msg = reinterpret_cast<const vessel::MsgSetPluginParam*>(frame);
-            pw_thread_loop_lock(thread_loop);
-            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
-            if (instance && instance->plugin) {
-                const uint64_t before = instance->plugin->ui_schema_version();
-                instance->plugin->set_param(msg->param_id, msg->value);
-                const uint64_t after = instance->plugin->ui_schema_version();
-                if (after != before) {
-                    refresh_plugin_param_cache(*instance);
+            {
+                std::lock_guard<std::mutex> lock(rack.plugins_mutex);
+                PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+                if (instance && instance->plugin) {
                     send_plugin_params_reset(client_fd, msg->instance_id);
                     send_plugin_params(client_fd, msg->instance_id, *instance->plugin);
                     send_plugin_custom_controls(client_fd, msg->instance_id, *instance->plugin);
                 }
             }
             pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::SET_PLUGIN_PARAM && frame_size == sizeof(vessel::MsgSetPluginParam)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgSetPluginParam*>(frame);
+            pw_thread_loop_lock(thread_loop);
+            {
+                std::lock_guard<std::mutex> lock(rack.plugins_mutex);
+                PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+                if (instance && instance->plugin) {
+                    const uint64_t before = instance->plugin->ui_schema_version();
+                    instance->plugin->set_param(msg->param_id, msg->value);
+                    const uint64_t after = instance->plugin->ui_schema_version();
+                    if (after != before) {
+                        refresh_plugin_param_cache(*instance);
+                        send_plugin_params_reset(client_fd, msg->instance_id);
+                        send_plugin_params(client_fd, msg->instance_id, *instance->plugin);
+                        send_plugin_custom_controls(client_fd, msg->instance_id, *instance->plugin);
+                    }
+                }
+            }
+            pw_thread_loop_unlock(thread_loop);
         } else if (hdr->type == vessel::MsgType::REMOVE_PLUGIN && frame_size == sizeof(vessel::MsgRemovePlugin)) {
             const auto* msg = reinterpret_cast<const vessel::MsgRemovePlugin*>(frame);
+            runner_log("REMOVE_PLUGIN instance_id=" + std::to_string(msg->instance_id));
             pw_thread_loop_lock(thread_loop);
-            rack.plugins.erase(
-                std::remove_if(
-                    rack.plugins.begin(),
-                    rack.plugins.end(),
-                    [&](const PluginInstance& p) { return p.instance_id == msg->instance_id; }),
-                rack.plugins.end());
+            {
+                std::lock_guard<std::mutex> lock(rack.plugins_mutex);
+                rack.plugins.erase(
+                    std::remove_if(
+                        rack.plugins.begin(),
+                        rack.plugins.end(),
+                        [&](const PluginInstance& p) { return p.instance_id == msg->instance_id; }),
+                    rack.plugins.end());
+            }
             pw_thread_loop_unlock(thread_loop);
         } else if (hdr->type == vessel::MsgType::SET_PLUGIN_BYPASS && frame_size == sizeof(vessel::MsgSetPluginBypass)) {
             const auto* msg = reinterpret_cast<const vessel::MsgSetPluginBypass*>(frame);
@@ -899,7 +927,10 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
         } else if (hdr->type == vessel::MsgType::MOVE_PLUGIN && frame_size == sizeof(vessel::MsgMovePlugin)) {
             const auto* msg = reinterpret_cast<const vessel::MsgMovePlugin*>(frame);
             pw_thread_loop_lock(thread_loop);
-            move_plugin_instance(rack.plugins, msg->instance_id, msg->target_index);
+                {
+                    std::lock_guard<std::mutex> lock(rack.plugins_mutex);
+                    move_plugin_instance(rack.plugins, msg->instance_id, msg->target_index);
+                }
             pw_thread_loop_unlock(thread_loop);
         } else if (hdr->type == vessel::MsgType::OPEN_PLUGIN_UI && frame_size == sizeof(vessel::MsgOpenPluginUi)) {
             const auto* msg = reinterpret_cast<const vessel::MsgOpenPluginUi*>(frame);
@@ -1151,16 +1182,19 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        for (auto& instance : rack.plugins) {
-            instance.plugin->pump_ui();
+        {
+            std::lock_guard<std::mutex> lock(rack.plugins_mutex);
+            for (auto& instance : rack.plugins) {
+                instance.plugin->pump_ui();
 
-            const bool ui_is_open = instance.plugin->is_custom_ui_open();
-            if (ui_is_open != instance.custom_ui_open) {
-                instance.custom_ui_open = ui_is_open;
-                send_plugin_ui_state(client_fd, instance.instance_id, ui_is_open);
+                const bool ui_is_open = instance.plugin->is_custom_ui_open();
+                if (ui_is_open != instance.custom_ui_open) {
+                    instance.custom_ui_open = ui_is_open;
+                    send_plugin_ui_state(client_fd, instance.instance_id, ui_is_open);
+                }
+
+                flush_plugin_param_changes(client_fd, instance);
             }
-
-            flush_plugin_param_changes(client_fd, instance);
         }
 
         const auto now = std::chrono::steady_clock::now();
