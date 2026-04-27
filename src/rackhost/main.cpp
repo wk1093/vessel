@@ -5,9 +5,12 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -41,6 +44,18 @@ struct PluginInstance {
     bool custom_ui_open = false;
     std::vector<PluginParamSpec> param_specs;
     std::vector<float> last_param_values;
+};
+
+struct SavedPluginState {
+    uint32_t plugin_type_id = 0;
+    bool bypassed = false;
+    std::vector<std::pair<uint32_t, float>> params;
+};
+
+struct SavedRackState {
+    float master_gain = 1.0f;
+    bool bypassed = false;
+    std::vector<SavedPluginState> plugins;
 };
 
 struct RunnerRack {
@@ -140,6 +155,13 @@ void send_plugin_ui_state(int client_fd, uint32_t instance_id, bool is_open) {
     send_ipc(client_fd, msg);
 }
 
+void send_plugin_params(int client_fd, uint32_t instance_id, RackPlugin& plugin);
+
+void send_rack_state_reset(int client_fd) {
+    vessel::MsgRackStateReset msg;
+    send_ipc(client_fd, msg);
+}
+
 void send_plugin_param_desc_value(int client_fd, uint32_t instance_id, const PluginParamSpec& spec, float value, uint8_t is_last) {
     vessel::MsgPluginParamDesc msg;
     msg.instance_id = instance_id;
@@ -197,6 +219,201 @@ void flush_plugin_param_changes(int client_fd, PluginInstance& instance) {
             send_plugin_param_desc_value(client_fd, instance.instance_id, instance.param_specs[i], value, 1);
         }
     }
+}
+
+std::string cstr_from_fixed(const char* data, size_t max_len) {
+    size_t len = 0;
+    while (len < max_len && data[len] != '\0') {
+        ++len;
+    }
+    return std::string(data, len);
+}
+
+bool save_rack_to_file(const RunnerRack& rack, const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    try {
+        const std::filesystem::path p(path);
+        if (!p.parent_path().empty()) {
+            std::filesystem::create_directories(p.parent_path());
+        }
+    } catch (...) {
+        return false;
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        return false;
+    }
+
+    out << "VSRK1\n";
+    out << "master_gain " << rack.audio_state.volume.load(std::memory_order_relaxed) << "\n";
+    out << "bypassed " << (rack.audio_state.bypassed.load(std::memory_order_relaxed) ? 1 : 0) << "\n";
+    out << "plugin_count " << rack.plugins.size() << "\n";
+
+    for (const auto& instance : rack.plugins) {
+        const uint32_t plugin_type_id = instance.plugin ? instance.plugin->type_id() : 0;
+        const std::vector<PluginParamSpec> specs = instance.plugin ? instance.plugin->param_specs() : std::vector<PluginParamSpec>{};
+        out << "plugin " << plugin_type_id << " " << (instance.bypassed ? 1 : 0) << " " << specs.size() << "\n";
+        for (const auto& spec : specs) {
+            const float value = instance.plugin->get_param(spec.id);
+            out << "param " << spec.id << " " << value << "\n";
+        }
+    }
+
+    return out.good();
+}
+
+bool load_rack_from_file(const std::string& path, SavedRackState& out_state) {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        return false;
+    }
+
+    std::string magic;
+    in >> magic;
+    if (!in.good() || magic != "VSRK1") {
+        return false;
+    }
+
+    std::string key;
+    in >> key >> out_state.master_gain;
+    if (!in.good() || key != "master_gain") {
+        return false;
+    }
+
+    int bypassed = 0;
+    in >> key >> bypassed;
+    if (!in.good() || key != "bypassed") {
+        return false;
+    }
+    out_state.bypassed = bypassed != 0;
+
+    size_t plugin_count = 0;
+    in >> key >> plugin_count;
+    if (!in.good() || key != "plugin_count") {
+        return false;
+    }
+
+    out_state.plugins.clear();
+    out_state.plugins.reserve(plugin_count);
+
+    for (size_t i = 0; i < plugin_count; ++i) {
+        SavedPluginState plugin;
+        int plugin_bypassed = 0;
+        size_t param_count = 0;
+
+        in >> key >> plugin.plugin_type_id >> plugin_bypassed >> param_count;
+        if (!in.good() || key != "plugin") {
+            return false;
+        }
+        plugin.bypassed = plugin_bypassed != 0;
+
+        plugin.params.reserve(param_count);
+        for (size_t p = 0; p < param_count; ++p) {
+            uint32_t param_id = 0;
+            float value = 0.0f;
+            in >> key >> param_id >> value;
+            if (!in.good() || key != "param") {
+                return false;
+            }
+            plugin.params.push_back({param_id, value});
+        }
+
+        out_state.plugins.push_back(std::move(plugin));
+    }
+
+    return true;
+}
+
+bool save_plugin_preset_to_file(const PluginInstance& instance, const std::string& path) {
+    if (!instance.plugin || path.empty()) {
+        return false;
+    }
+
+    try {
+        const std::filesystem::path p(path);
+        if (!p.parent_path().empty()) {
+            std::filesystem::create_directories(p.parent_path());
+        }
+    } catch (...) {
+        return false;
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        return false;
+    }
+
+    const std::vector<PluginParamSpec> specs = instance.plugin->param_specs();
+    out << "VSPT1\n";
+    out << "plugin_type_id " << instance.plugin->type_id() << "\n";
+    out << "param_count " << specs.size() << "\n";
+    for (const auto& spec : specs) {
+        const float value = instance.plugin->get_param(spec.id);
+        out << "param " << spec.id << " " << value << "\n";
+    }
+
+    return out.good();
+}
+
+bool load_plugin_preset_from_file(const std::string& path, uint32_t& plugin_type_id_out, std::vector<std::pair<uint32_t, float>>& params_out) {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        return false;
+    }
+
+    std::string magic;
+    in >> magic;
+    if (!in.good() || magic != "VSPT1") {
+        return false;
+    }
+
+    std::string key;
+    in >> key >> plugin_type_id_out;
+    if (!in.good() || key != "plugin_type_id") {
+        return false;
+    }
+
+    size_t param_count = 0;
+    in >> key >> param_count;
+    if (!in.good() || key != "param_count") {
+        return false;
+    }
+
+    params_out.clear();
+    params_out.reserve(param_count);
+
+    for (size_t i = 0; i < param_count; ++i) {
+        uint32_t param_id = 0;
+        float value = 0.0f;
+        in >> key >> param_id >> value;
+        if (!in.good() || key != "param") {
+            return false;
+        }
+        params_out.push_back({param_id, value});
+    }
+
+    return true;
+}
+
+void send_plugin_instance_state(int client_fd, const PluginInstance& instance) {
+    if (!instance.plugin) {
+        return;
+    }
+
+    vessel::MsgPluginInstanceAdded added_msg;
+    added_msg.instance_id = instance.instance_id;
+    added_msg.plugin_type_id = instance.plugin->type_id();
+    std::strncpy(added_msg.name, instance.plugin->display_name(), vessel::kMaxPluginNameLen);
+    added_msg.name[vessel::kMaxPluginNameLen] = '\0';
+    added_msg.has_custom_ui = instance.plugin->has_custom_ui() ? 1 : 0;
+    send_ipc(client_fd, added_msg);
+
+    send_plugin_ui_state(client_fd, instance.instance_id, instance.custom_ui_open);
+    send_plugin_params(client_fd, instance.instance_id, *instance.plugin);
 }
 
 void send_plugin_catalog(int client_fd) {
@@ -450,8 +667,6 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
             }
             if (plugin) {
                 const uint32_t instance_id = rack.next_plugin_instance_id++;
-                const uint32_t type_id = msg->plugin_type_id;
-                const char* display_name = plugin->display_name();
 
                 pw_thread_loop_lock(thread_loop);
                 PluginInstance new_instance;
@@ -461,17 +676,9 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                 rack.plugins.push_back(std::move(new_instance));
                 PluginInstance* added_instance = find_plugin_instance(rack, instance_id);
                 if (added_instance && added_instance->plugin) {
-                    RackPlugin* added = added_instance->plugin.get();
                     refresh_plugin_param_cache(*added_instance);
-                    vessel::MsgPluginInstanceAdded added_msg;
-                    added_msg.instance_id = instance_id;
-                    added_msg.plugin_type_id = type_id;
-                    std::strncpy(added_msg.name, display_name, vessel::kMaxPluginNameLen);
-                    added_msg.name[vessel::kMaxPluginNameLen] = '\0';
-                    added_msg.has_custom_ui = added->has_custom_ui() ? 1 : 0;
-                    send_ipc(client_fd, added_msg);
-                    send_plugin_ui_state(client_fd, instance_id, false);
-                    send_plugin_params(client_fd, instance_id, *added);
+                    added_instance->custom_ui_open = false;
+                    send_plugin_instance_state(client_fd, *added_instance);
                 }
                 pw_thread_loop_unlock(thread_loop);
             }
@@ -527,6 +734,89 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
                 const bool is_open = instance->plugin->is_custom_ui_open();
                 instance->custom_ui_open = is_open;
                 send_plugin_ui_state(client_fd, msg->instance_id, is_open);
+            }
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::SAVE_RACK_TO_FILE && frame_size == sizeof(vessel::MsgSaveRackToFile)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgSaveRackToFile*>(frame);
+            const std::string path = cstr_from_fixed(msg->path, vessel::kMaxFilePathLen);
+            pw_thread_loop_lock(thread_loop);
+            save_rack_to_file(rack, path);
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::LOAD_RACK_FROM_FILE && frame_size == sizeof(vessel::MsgLoadRackFromFile)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgLoadRackFromFile*>(frame);
+            const std::string path = cstr_from_fixed(msg->path, vessel::kMaxFilePathLen);
+
+            SavedRackState state;
+            if (!load_rack_from_file(path, state)) {
+                rack.rx_buffer.erase(rack.rx_buffer.begin(), rack.rx_buffer.begin() + static_cast<long>(frame_size));
+                continue;
+            }
+
+            pw_thread_loop_lock(thread_loop);
+
+            rack.audio_state.volume.store(state.master_gain, std::memory_order_relaxed);
+            rack.audio_state.bypassed.store(state.bypassed, std::memory_order_relaxed);
+            rack.plugins.clear();
+
+            for (const auto& saved : state.plugins) {
+                std::unique_ptr<RackPlugin> plugin = create_plugin(saved.plugin_type_id);
+                if (!plugin) {
+                    const DiscoveredLv2Plugin* lv2 = find_lv2_plugin(rack, saved.plugin_type_id);
+                    if (lv2) {
+                        plugin = create_lv2_plugin(*lv2);
+                    }
+                }
+                if (!plugin) {
+                    continue;
+                }
+
+                const uint32_t instance_id = rack.next_plugin_instance_id++;
+                PluginInstance instance;
+                instance.instance_id = instance_id;
+                instance.bypassed = saved.bypassed;
+                instance.plugin = std::move(plugin);
+
+                for (const auto& param : saved.params) {
+                    instance.plugin->set_param(param.first, param.second);
+                }
+
+                refresh_plugin_param_cache(instance);
+                instance.custom_ui_open = false;
+                rack.plugins.push_back(std::move(instance));
+            }
+
+            send_rack_state_reset(client_fd);
+            for (const auto& instance : rack.plugins) {
+                send_plugin_instance_state(client_fd, instance);
+            }
+
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::SAVE_PLUGIN_PRESET && frame_size == sizeof(vessel::MsgSavePluginPreset)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgSavePluginPreset*>(frame);
+            const std::string path = cstr_from_fixed(msg->path, vessel::kMaxFilePathLen);
+            pw_thread_loop_lock(thread_loop);
+            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+            if (instance) {
+                save_plugin_preset_to_file(*instance, path);
+            }
+            pw_thread_loop_unlock(thread_loop);
+        } else if (hdr->type == vessel::MsgType::LOAD_PLUGIN_PRESET && frame_size == sizeof(vessel::MsgLoadPluginPreset)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgLoadPluginPreset*>(frame);
+            const std::string path = cstr_from_fixed(msg->path, vessel::kMaxFilePathLen);
+
+            uint32_t preset_type_id = 0;
+            std::vector<std::pair<uint32_t, float>> params;
+            if (!load_plugin_preset_from_file(path, preset_type_id, params)) {
+                rack.rx_buffer.erase(rack.rx_buffer.begin(), rack.rx_buffer.begin() + static_cast<long>(frame_size));
+                continue;
+            }
+
+            pw_thread_loop_lock(thread_loop);
+            PluginInstance* instance = find_plugin_instance(rack, msg->instance_id);
+            if (instance && instance->plugin && instance->plugin->type_id() == preset_type_id) {
+                for (const auto& param : params) {
+                    instance->plugin->set_param(param.first, param.second);
+                }
             }
             pw_thread_loop_unlock(thread_loop);
         }

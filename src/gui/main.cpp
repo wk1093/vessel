@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -255,6 +256,9 @@ void drain_ipc(Rack& rack) {
             const auto* msg = reinterpret_cast<const vessel::MsgPeakLevels*>(frame);
             rack.in_peak = std::max(rack.in_peak, msg->in_peak);
             rack.out_peak = std::max(rack.out_peak, msg->out_peak);
+        } else if (hdr->type == vessel::MsgType::RACK_STATE_RESET
+                   && frame_size == sizeof(vessel::MsgRackStateReset)) {
+            rack.plugins.clear();
         } else if (hdr->type == vessel::MsgType::PLUGIN_CATALOG_ENTRY
                    && frame_size == sizeof(vessel::MsgPluginCatalogEntry)) {
             const auto* msg = reinterpret_cast<const vessel::MsgPluginCatalogEntry*>(frame);
@@ -479,6 +483,17 @@ int main(int, char* argv[]) {
     bool show_rename = false;
     int rack_to_rename = -1;
     char rename_buf[vessel::kMaxNameLen + 1]{};
+
+    bool show_save_rack = false;
+    bool show_load_rack = false;
+    int rack_for_file_action = -1;
+    char rack_file_buf[vessel::kMaxFilePathLen + 1]{};
+
+    bool show_save_preset = false;
+    bool show_load_preset = false;
+    int rack_for_preset_action = -1;
+    uint32_t plugin_for_preset_action = 0;
+    char preset_file_buf[vessel::kMaxFilePathLen + 1]{};
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -716,6 +731,20 @@ int main(int, char* argv[]) {
                 }
 
                 if (header_open) {
+                    if (ImGui::Button("Save Preset")) {
+                        show_save_preset = true;
+                        rack_for_preset_action = r;
+                        plugin_for_preset_action = plugin.instance_id;
+                        std::snprintf(preset_file_buf, sizeof(preset_file_buf), "preset-%u.vsp", plugin.instance_id);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Load Preset")) {
+                        show_load_preset = true;
+                        rack_for_preset_action = r;
+                        plugin_for_preset_action = plugin.instance_id;
+                        std::snprintf(preset_file_buf, sizeof(preset_file_buf), "preset-%u.vsp", plugin.instance_id);
+                    }
+
                     for (auto& param : plugin.params) {
                         ImGui::PushID(static_cast<int>(param.param_id));
 
@@ -831,6 +860,17 @@ int main(int, char* argv[]) {
             }
 
             if (ImGui::BeginPopupContextWindow()) {
+                if (ImGui::MenuItem("Save Rack to File")) {
+                    show_save_rack = true;
+                    rack_for_file_action = r;
+                    std::snprintf(rack_file_buf, sizeof(rack_file_buf), "rack-%u.vrk", rack.id);
+                }
+                if (ImGui::MenuItem("Load Rack from File")) {
+                    show_load_rack = true;
+                    rack_for_file_action = r;
+                    std::snprintf(rack_file_buf, sizeof(rack_file_buf), "rack-%u.vrk", rack.id);
+                }
+                ImGui::Separator();
                 if (ImGui::MenuItem("Rename Rack")) {
                     show_rename = true;
                     rack_to_rename = r;
@@ -873,6 +913,128 @@ int main(int, char* argv[]) {
                 rack_to_rename = -1;
                 ImGui::CloseCurrentPopup();
             }
+            ImGui::EndPopup();
+        }
+
+        if (show_save_rack) {
+            ImGui::OpenPopup("Save Rack to File");
+            show_save_rack = false;
+        }
+        if (ImGui::BeginPopupModal("Save Rack to File", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Path:");
+            ImGui::SetNextItemWidth(420.0f);
+            ImGui::InputText("##save_rack_path", rack_file_buf, sizeof(rack_file_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::Separator();
+
+            if (ImGui::Button("Save", ImVec2(120, 0))) {
+                if (rack_for_file_action >= 0 && rack_for_file_action < static_cast<int>(racks.size())) {
+                    vessel::MsgSaveRackToFile msg;
+                    std::strncpy(msg.path, rack_file_buf, vessel::kMaxFilePathLen);
+                    msg.path[vessel::kMaxFilePathLen] = '\0';
+                    send_ipc(*racks[rack_for_file_action], msg);
+                }
+                rack_for_file_action = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                rack_for_file_action = -1;
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::EndPopup();
+        }
+
+        if (show_load_rack) {
+            ImGui::OpenPopup("Load Rack from File");
+            show_load_rack = false;
+        }
+        if (ImGui::BeginPopupModal("Load Rack from File", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Path:");
+            ImGui::SetNextItemWidth(420.0f);
+            ImGui::InputText("##load_rack_path", rack_file_buf, sizeof(rack_file_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::Separator();
+
+            if (ImGui::Button("Load", ImVec2(120, 0))) {
+                if (rack_for_file_action >= 0 && rack_for_file_action < static_cast<int>(racks.size())) {
+                    vessel::MsgLoadRackFromFile msg;
+                    std::strncpy(msg.path, rack_file_buf, vessel::kMaxFilePathLen);
+                    msg.path[vessel::kMaxFilePathLen] = '\0';
+                    send_ipc(*racks[rack_for_file_action], msg);
+                }
+                rack_for_file_action = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                rack_for_file_action = -1;
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::EndPopup();
+        }
+
+        if (show_save_preset) {
+            ImGui::OpenPopup("Save Plugin Preset");
+            show_save_preset = false;
+        }
+        if (ImGui::BeginPopupModal("Save Plugin Preset", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Path:");
+            ImGui::SetNextItemWidth(420.0f);
+            ImGui::InputText("##save_preset_path", preset_file_buf, sizeof(preset_file_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::Separator();
+
+            if (ImGui::Button("Save", ImVec2(120, 0))) {
+                if (rack_for_preset_action >= 0 && rack_for_preset_action < static_cast<int>(racks.size())) {
+                    vessel::MsgSavePluginPreset msg;
+                    msg.instance_id = plugin_for_preset_action;
+                    std::strncpy(msg.path, preset_file_buf, vessel::kMaxFilePathLen);
+                    msg.path[vessel::kMaxFilePathLen] = '\0';
+                    send_ipc(*racks[rack_for_preset_action], msg);
+                }
+                rack_for_preset_action = -1;
+                plugin_for_preset_action = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                rack_for_preset_action = -1;
+                plugin_for_preset_action = 0;
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::EndPopup();
+        }
+
+        if (show_load_preset) {
+            ImGui::OpenPopup("Load Plugin Preset");
+            show_load_preset = false;
+        }
+        if (ImGui::BeginPopupModal("Load Plugin Preset", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Path:");
+            ImGui::SetNextItemWidth(420.0f);
+            ImGui::InputText("##load_preset_path", preset_file_buf, sizeof(preset_file_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::Separator();
+
+            if (ImGui::Button("Load", ImVec2(120, 0))) {
+                if (rack_for_preset_action >= 0 && rack_for_preset_action < static_cast<int>(racks.size())) {
+                    vessel::MsgLoadPluginPreset msg;
+                    msg.instance_id = plugin_for_preset_action;
+                    std::strncpy(msg.path, preset_file_buf, vessel::kMaxFilePathLen);
+                    msg.path[vessel::kMaxFilePathLen] = '\0';
+                    send_ipc(*racks[rack_for_preset_action], msg);
+                }
+                rack_for_preset_action = -1;
+                plugin_for_preset_action = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                rack_for_preset_action = -1;
+                plugin_for_preset_action = 0;
+                ImGui::CloseCurrentPopup();
+            }
+
             ImGui::EndPopup();
         }
 

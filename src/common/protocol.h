@@ -13,6 +13,7 @@ inline std::string socket_path_by_id(uint32_t id) {
 static constexpr uint32_t kMaxNameLen = 63;  // excluding null terminator; used by GUI for rack display names
 static constexpr uint32_t kMaxPluginNameLen = 63;
 static constexpr uint32_t kMaxParamNameLen = 47;
+static constexpr uint32_t kMaxFilePathLen = 191;
 
 enum class MsgType : uint8_t {
     SET_GAIN             = 0x01,
@@ -33,6 +34,11 @@ enum class MsgType : uint8_t {
     OPEN_PLUGIN_UI       = 0x1C,  // GUI -> runner
     PLUGIN_UI_STATE      = 0x1D,  // runner -> GUI
     PLUGIN_PARAM_ENUM_OPTION = 0x1E, // runner -> GUI
+    SAVE_RACK_TO_FILE    = 0x1F,  // GUI -> runner
+    LOAD_RACK_FROM_FILE  = 0x20,  // GUI -> runner
+    SAVE_PLUGIN_PRESET   = 0x21,  // GUI -> runner
+    LOAD_PLUGIN_PRESET   = 0x22,  // GUI -> runner
+    RACK_STATE_RESET     = 0x23,  // runner -> GUI
 };
 
 enum class ParamWidget : uint8_t {
@@ -175,6 +181,32 @@ struct __attribute__((packed)) MsgPluginParamEnumOption {
     int32_t enum_value{0};
     char label[kMaxParamNameLen + 1]{};
     uint8_t is_last{0};
+};
+
+struct __attribute__((packed)) MsgSaveRackToFile {
+    MsgHeader hdr{MsgType::SAVE_RACK_TO_FILE, sizeof(MsgSaveRackToFile)};
+    char path[kMaxFilePathLen + 1]{};
+};
+
+struct __attribute__((packed)) MsgLoadRackFromFile {
+    MsgHeader hdr{MsgType::LOAD_RACK_FROM_FILE, sizeof(MsgLoadRackFromFile)};
+    char path[kMaxFilePathLen + 1]{};
+};
+
+struct __attribute__((packed)) MsgSavePluginPreset {
+    MsgHeader hdr{MsgType::SAVE_PLUGIN_PRESET, sizeof(MsgSavePluginPreset)};
+    uint32_t instance_id{0};
+    char path[kMaxFilePathLen + 1]{};
+};
+
+struct __attribute__((packed)) MsgLoadPluginPreset {
+    MsgHeader hdr{MsgType::LOAD_PLUGIN_PRESET, sizeof(MsgLoadPluginPreset)};
+    uint32_t instance_id{0};
+    char path[kMaxFilePathLen + 1]{};
+};
+
+struct __attribute__((packed)) MsgRackStateReset {
+    MsgHeader hdr{MsgType::RACK_STATE_RESET, sizeof(MsgRackStateReset)};
 };
 
 }  // namespace vessel
