@@ -170,6 +170,8 @@ void send_plugin_params(int client_fd, uint32_t instance_id, RackPlugin& plugin)
         msg.instance_id = instance_id;
         msg.param_id = spec.id;
         msg.widget = spec.widget;
+        msg.value_type = spec.value_type;
+        msg.flags = spec.flags;
         msg.min_value = spec.min_value;
         msg.max_value = spec.max_value;
         msg.value = plugin.get_param(spec.id);

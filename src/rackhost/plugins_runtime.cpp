@@ -9,6 +9,7 @@
 
 #include <lilv/lilv.h>
 #include <lv2/core/lv2.h>
+#include <lv2/port-props/port-props.h>
 #include <lv2/ui/ui.h>
 #include <suil/suil.h>
 
@@ -40,6 +41,19 @@ float sanitize_max(float value, float min_value) {
         return min_value + 1.0f;
     }
     return value;
+}
+
+float quantize_by_type(vessel::ParamValueType value_type, float value) {
+    switch (value_type) {
+        case vessel::ParamValueType::BOOL:
+            return value >= 0.5f ? 1.0f : 0.0f;
+        case vessel::ParamValueType::INT:
+        case vessel::ParamValueType::ENUM:
+            return std::round(value);
+        case vessel::ParamValueType::FLOAT:
+        default:
+            return value;
+    }
 }
 
 class SineMixerPlugin final : public RackPlugin {
@@ -189,6 +203,11 @@ public:
         LilvNode* control_class = lilv_new_uri(world_, LV2_CORE__ControlPort);
         LilvNode* input_class = lilv_new_uri(world_, LV2_CORE__InputPort);
         LilvNode* output_class = lilv_new_uri(world_, LV2_CORE__OutputPort);
+        LilvNode* port_property_pred = lilv_new_uri(world_, LV2_CORE__portProperty);
+        LilvNode* toggled_prop = lilv_new_uri(world_, LV2_CORE__toggled);
+        LilvNode* integer_prop = lilv_new_uri(world_, LV2_CORE__integer);
+        LilvNode* enumeration_prop = lilv_new_uri(world_, LV2_CORE__enumeration);
+        LilvNode* logarithmic_prop = lilv_new_uri(world_, LV2_PORT_PROPS__logarithmic);
 
         const uint32_t num_ports = lilv_plugin_get_num_ports(plugin_);
         std::vector<float> mins(num_ports, 0.0f);
@@ -215,13 +234,63 @@ public:
                 const LilvNode* name_node = lilv_port_get_name(plugin_, port);
                 const char* raw_name = name_node ? lilv_node_as_string(name_node) : nullptr;
 
+                bool is_toggled = false;
+                bool is_integer = false;
+                bool is_enumeration = false;
+                bool is_logarithmic = false;
+                if (port_property_pred) {
+                    LilvNodes* properties = lilv_port_get_value(plugin_, port, port_property_pred);
+                    if (properties) {
+                        LILV_FOREACH(nodes, pit, properties) {
+                            const LilvNode* prop = lilv_nodes_get(properties, pit);
+                            if (toggled_prop && lilv_node_equals(prop, toggled_prop)) {
+                                is_toggled = true;
+                            } else if (integer_prop && lilv_node_equals(prop, integer_prop)) {
+                                is_integer = true;
+                            } else if (enumeration_prop && lilv_node_equals(prop, enumeration_prop)) {
+                                is_enumeration = true;
+                            } else if (logarithmic_prop && lilv_node_equals(prop, logarithmic_prop)) {
+                                is_logarithmic = true;
+                            }
+                        }
+                        lilv_nodes_free(properties);
+                    }
+                }
+
                 ControlParam p;
                 p.param_id = next_param_id++;
                 p.port_index = i;
                 p.name = raw_name ? raw_name : "Control";
+                p.widget = vessel::ParamWidget::SLIDER;
+                p.value_type = vessel::ParamValueType::FLOAT;
+                p.flags = vessel::PARAM_FLAG_NONE;
+
+                if (is_toggled) {
+                    p.widget = vessel::ParamWidget::TOGGLE;
+                    p.value_type = vessel::ParamValueType::BOOL;
+                } else if (is_enumeration) {
+                    p.value_type = vessel::ParamValueType::ENUM;
+                } else if (is_integer) {
+                    p.value_type = vessel::ParamValueType::INT;
+                }
+
+                if (is_logarithmic && p.value_type == vessel::ParamValueType::FLOAT) {
+                    p.flags = static_cast<uint8_t>(p.flags | vessel::PARAM_FLAG_LOGARITHMIC);
+                }
+
                 p.min_value = sanitize_min(mins[i]);
                 p.max_value = sanitize_max(maxs[i], p.min_value);
                 p.default_value = std::clamp(sanitize_default(defs[i], p.min_value), p.min_value, p.max_value);
+
+                if (p.value_type == vessel::ParamValueType::BOOL) {
+                    p.min_value = 0.0f;
+                    p.max_value = 1.0f;
+                }
+
+                p.default_value = std::clamp(
+                    quantize_by_type(p.value_type, p.default_value),
+                    p.min_value,
+                    p.max_value);
                 p.value = p.default_value;
                 controls_.push_back(std::move(p));
             }
@@ -231,6 +300,11 @@ public:
         lilv_node_free(control_class);
         lilv_node_free(input_class);
         lilv_node_free(output_class);
+        lilv_node_free(port_property_pred);
+        lilv_node_free(toggled_prop);
+        lilv_node_free(integer_prop);
+        lilv_node_free(enumeration_prop);
+        lilv_node_free(logarithmic_prop);
 
         if (audio_in_port_ == std::numeric_limits<uint32_t>::max()
             || audio_out_port_ == std::numeric_limits<uint32_t>::max()) {
@@ -311,10 +385,12 @@ public:
             out.push_back({
                 p.param_id,
                 p.name.c_str(),
-                vessel::ParamWidget::SLIDER,
+                p.widget,
                 p.min_value,
                 p.max_value,
                 p.default_value,
+                p.value_type,
+                p.flags,
             });
         }
         return out;
@@ -332,7 +408,10 @@ public:
     void set_param(uint32_t param_id, float value) override {
         for (size_t i = 0; i < controls_.size(); ++i) {
             if (controls_[i].param_id == param_id) {
-                const float clamped = std::clamp(value, controls_[i].min_value, controls_[i].max_value);
+                const float clamped = std::clamp(
+                    quantize_by_type(controls_[i].value_type, value),
+                    controls_[i].min_value,
+                    controls_[i].max_value);
                 controls_[i].value = clamped;
                 control_values_l_[i] = clamped;
                 control_values_r_[i] = clamped;
@@ -500,6 +579,9 @@ private:
         uint32_t param_id = 0;
         uint32_t port_index = 0;
         std::string name;
+        vessel::ParamWidget widget = vessel::ParamWidget::SLIDER;
+        vessel::ParamValueType value_type = vessel::ParamValueType::FLOAT;
+        uint8_t flags = vessel::PARAM_FLAG_NONE;
         float min_value = 0.0f;
         float max_value = 1.0f;
         float default_value = 0.0f;

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -33,6 +34,8 @@ struct RackPluginType {
 struct RackPluginParam {
     uint32_t param_id = 0;
     vessel::ParamWidget widget = vessel::ParamWidget::SLIDER;
+    vessel::ParamValueType value_type = vessel::ParamValueType::FLOAT;
+    uint8_t flags = vessel::PARAM_FLAG_NONE;
     std::string name;
     float min_value = 0.0f;
     float max_value = 1.0f;
@@ -151,6 +154,14 @@ void send_ipc(Rack& rack, const T& msg) {
         ::close(rack.sock_fd);
         rack.sock_fd = -1;
     }
+}
+
+void send_param_update(Rack& rack, const RackPluginInstance& plugin, const RackPluginParam& param, float value) {
+    vessel::MsgSetPluginParam msg;
+    msg.instance_id = plugin.instance_id;
+    msg.param_id = param.param_id;
+    msg.value = value;
+    send_ipc(rack, msg);
 }
 
 RackPluginInstance* find_plugin_instance(Rack& rack, uint32_t instance_id) {
@@ -293,6 +304,8 @@ void drain_ipc(Rack& rack) {
                 }
                 param_ptr->param_id = msg->param_id;
                 param_ptr->widget = msg->widget;
+                param_ptr->value_type = msg->value_type;
+                param_ptr->flags = msg->flags;
                 param_ptr->name = msg->name;
                 param_ptr->min_value = msg->min_value;
                 param_ptr->max_value = msg->max_value;
@@ -625,33 +638,35 @@ int main(int, char* argv[]) {
                     for (auto& param : plugin.params) {
                         ImGui::PushID(static_cast<int>(param.param_id));
 
-                        if (param.widget == vessel::ParamWidget::SLIDER) {
-                            float v = param.value;
-                            if (ImGui::SliderFloat(param.name.c_str(), &v, param.min_value, param.max_value)) {
-                                param.value = v;
-                                vessel::MsgSetPluginParam msg;
-                                msg.instance_id = plugin.instance_id;
-                                msg.param_id = param.param_id;
-                                msg.value = v;
-                                send_ipc(rack, msg);
+                        if (param.widget == vessel::ParamWidget::BUTTON) {
+                            if (ImGui::Button(param.name.c_str())) {
+                                send_param_update(rack, plugin, param, 1.0f);
                             }
-                        } else if (param.widget == vessel::ParamWidget::TOGGLE) {
+                        } else if (param.value_type == vessel::ParamValueType::BOOL
+                                   || param.widget == vessel::ParamWidget::TOGGLE) {
                             bool b = param.value > 0.5f;
                             if (ImGui::Checkbox(param.name.c_str(), &b)) {
                                 param.value = b ? 1.0f : 0.0f;
-                                vessel::MsgSetPluginParam msg;
-                                msg.instance_id = plugin.instance_id;
-                                msg.param_id = param.param_id;
-                                msg.value = param.value;
-                                send_ipc(rack, msg);
+                                send_param_update(rack, plugin, param, param.value);
                             }
-                        } else if (param.widget == vessel::ParamWidget::BUTTON) {
-                            if (ImGui::Button(param.name.c_str())) {
-                                vessel::MsgSetPluginParam msg;
-                                msg.instance_id = plugin.instance_id;
-                                msg.param_id = param.param_id;
-                                msg.value = 1.0f;
-                                send_ipc(rack, msg);
+                        } else if (param.value_type == vessel::ParamValueType::INT
+                                   || param.value_type == vessel::ParamValueType::ENUM) {
+                            int v = static_cast<int>(std::lround(param.value));
+                            const int min_v = static_cast<int>(std::lround(param.min_value));
+                            const int max_v = std::max(min_v, static_cast<int>(std::lround(param.max_value)));
+                            if (ImGui::SliderInt(param.name.c_str(), &v, min_v, max_v)) {
+                                param.value = static_cast<float>(v);
+                                send_param_update(rack, plugin, param, param.value);
+                            }
+                        } else {
+                            float v = param.value;
+                            ImGuiSliderFlags slider_flags = ImGuiSliderFlags_None;
+                            if ((param.flags & vessel::PARAM_FLAG_LOGARITHMIC) != 0) {
+                                slider_flags = static_cast<ImGuiSliderFlags>(slider_flags | ImGuiSliderFlags_Logarithmic);
+                            }
+                            if (ImGui::SliderFloat(param.name.c_str(), &v, param.min_value, param.max_value, "%.3f", slider_flags)) {
+                                param.value = v;
+                                send_param_update(rack, plugin, param, v);
                             }
                         }
 

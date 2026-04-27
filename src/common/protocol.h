@@ -39,6 +39,18 @@ enum class ParamWidget : uint8_t {
     TOGGLE = 2,
 };
 
+enum class ParamValueType : uint8_t {
+    FLOAT = 0,
+    INT = 1,
+    BOOL = 2,
+    ENUM = 3,
+};
+
+enum ParamFlags : uint8_t {
+    PARAM_FLAG_NONE = 0,
+    PARAM_FLAG_LOGARITHMIC = 1u << 0,
+};
+
 // Every message begins with this 2-byte header.
 // `size` is the total byte count of the full message (header + payload).
 struct __attribute__((packed)) MsgHeader {
@@ -96,6 +108,8 @@ struct __attribute__((packed)) MsgPluginParamDesc {
     uint32_t instance_id{0};
     uint32_t param_id{0};
     ParamWidget widget{ParamWidget::SLIDER};
+    ParamValueType value_type{ParamValueType::FLOAT};
+    uint8_t flags{PARAM_FLAG_NONE};
     float min_value{0.0f};
     float max_value{1.0f};
     float value{0.0f};

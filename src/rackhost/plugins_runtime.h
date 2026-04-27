@@ -14,6 +14,8 @@ struct PluginParamSpec {
     float min_value;
     float max_value;
     float default_value;
+    vessel::ParamValueType value_type{vessel::ParamValueType::FLOAT};
+    uint8_t flags{vessel::PARAM_FLAG_NONE};
 };
 
 class RackPlugin {
