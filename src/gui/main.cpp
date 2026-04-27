@@ -219,6 +219,120 @@ bool open_file_picker(bool save_mode, const char* title, const std::string& curr
     return run_pick_command(cmd, out_path);
 }
 
+bool command_exists(const char* command) {
+    if (!command || command[0] == '\0') {
+        return false;
+    }
+
+    const char* path_env = std::getenv("PATH");
+    if (!path_env) {
+        return false;
+    }
+
+    std::string path_list(path_env);
+    size_t start = 0;
+    while (start <= path_list.size()) {
+        const size_t end = path_list.find(':', start);
+        const std::string dir = (end == std::string::npos)
+            ? path_list.substr(start)
+            : path_list.substr(start, end - start);
+
+        if (!dir.empty()) {
+            const std::filesystem::path candidate = std::filesystem::path(dir) / command;
+            if (::access(candidate.c_str(), X_OK) == 0) {
+                return true;
+            }
+        }
+
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return false;
+}
+
+std::string expand_home_path(const std::string& path) {
+    if (path.empty() || path[0] != '~') {
+        return path;
+    }
+
+    const char* home = std::getenv("HOME");
+    if (!home || home[0] == '\0') {
+        return path;
+    }
+
+    if (path.size() == 1) {
+        return std::string(home);
+    }
+    if (path[1] == '/') {
+        return std::string(home) + path.substr(1);
+    }
+
+    return path;
+}
+
+std::string detect_font_path_via_fc_match() {
+    std::string out;
+    if (!run_pick_command("fc-match -f '%{file}\\n' 'sans-serif' 2>/dev/null", out)) {
+        return "";
+    }
+
+    if (out.empty() || !std::filesystem::exists(out)) {
+        return "";
+    }
+
+    return out;
+}
+
+std::string detect_inter_font_path() {
+    const std::array<const char*, 12> candidates = {
+        "~/.local/share/fonts/Inter-Regular.ttf",
+        "~/.local/share/fonts/Inter Variable.ttf",
+        "~/.fonts/Inter-Regular.ttf",
+        "~/.fonts/Inter Variable.ttf",
+        "/usr/local/share/fonts/Inter-Regular.ttf",
+        "/usr/local/share/fonts/Inter Variable.ttf",
+        "/usr/share/fonts/TTF/Inter-Regular.ttf",
+        "/usr/share/fonts/TTF/InterVariable.ttf",
+        "/usr/share/fonts/TTF/Inter Variable.ttf",
+        "/usr/share/fonts/truetype/inter/Inter-Regular.ttf",
+        "/usr/share/fonts/inter/Inter-Regular.ttf",
+        "/usr/share/fonts/inter/InterVariable.ttf",
+    };
+
+    for (const char* raw_path : candidates) {
+        const std::string path = expand_home_path(raw_path ? raw_path : "");
+        if (!path.empty() && std::filesystem::exists(path)) {
+            return path;
+        }
+    }
+
+    return "";
+}
+
+void load_ui_font(ImGuiIO& io) {
+    constexpr float kFontSizePx = 16.0f;
+
+    bool loaded = false;
+    if (command_exists("fc-match")) {
+        const std::string font_path = detect_font_path_via_fc_match();
+        if (!font_path.empty()) {
+            loaded = io.Fonts->AddFontFromFileTTF(font_path.c_str(), kFontSizePx) != nullptr;
+        }
+    } else {
+        const std::string inter_path = detect_inter_font_path();
+        if (!inter_path.empty()) {
+            loaded = io.Fonts->AddFontFromFileTTF(inter_path.c_str(), kFontSizePx) != nullptr;
+        }
+    }
+
+    if (!loaded) {
+        io.Fonts->AddFontDefault();
+    }
+}
+
 void try_connect_socket(Rack& rack) {
     if (rack.sock_fd >= 0) return;
 
@@ -814,6 +928,7 @@ int main(int, char* argv[]) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    load_ui_font(io);
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");

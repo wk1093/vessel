@@ -11,6 +11,8 @@ The UI talks to runners over Unix sockets, while each runner appears as a PipeWi
 ![Vessel UI](docs/image.png)
 *Screenshot of Vessel UI with two racks and some random LV2 plugins loaded, as well as a few built-in plugins (Gain, Soundboard).*
 
+
+
 ## Contributing & Usage
 This project is licensed under MIT. If you use this code in your own project 
 or build a plugin for it, I'd love to hear about it! 
