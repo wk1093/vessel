@@ -112,6 +112,12 @@ struct RunnerRack {
     std::string default_source_name;
     uint32_t default_sink_id = PW_ID_ANY;
     uint32_t default_source_id = PW_ID_ANY;
+    std::string intercepted_sink_name;
+    std::string intercepted_source_name;
+    uint32_t intercepted_sink_id = PW_ID_ANY;
+    uint32_t intercepted_source_id = PW_ID_ANY;
+    bool owns_default_sink = false;
+    bool owns_default_source = false;
     bool routing_in_progress = false;
 
     struct pw_filter* filter = nullptr;
@@ -422,6 +428,20 @@ uint32_t resolve_default_node_id(const RunnerRack& rack, bool sink_mode) {
     return PW_ID_ANY;
 }
 
+uint32_t resolve_node_id_by_ref(const RunnerRack& rack, const std::string& name, uint32_t id) {
+    if (id != PW_ID_ANY && rack.nodes.find(id) != rack.nodes.end()) {
+        return id;
+    }
+    if (!name.empty()) {
+        for (const auto& kv : rack.nodes) {
+            if (kv.second.name == name) {
+                return kv.second.id;
+            }
+        }
+    }
+    return PW_ID_ANY;
+}
+
 uint32_t resolve_rack_node_id(const RunnerRack& rack) {
     const std::string expected_name = route_mode_to_node_name(rack.rack_id, rack.route_mode);
     for (const auto& kv : rack.nodes) {
@@ -430,6 +450,96 @@ uint32_t resolve_rack_node_id(const RunnerRack& rack) {
         }
     }
     return PW_ID_ANY;
+}
+
+bool set_default_node_metadata_locked(RunnerRack& rack, bool sink_mode, uint32_t node_id) {
+    if (!rack.metadata) {
+        return false;
+    }
+
+    const RunnerRack::NodeInfo* node = find_node_by_id(rack, node_id);
+    if (!node || node->name.empty()) {
+        return false;
+    }
+
+    const std::string key = sink_mode ? "default.audio.sink" : "default.audio.source";
+    const std::string value = std::string("{\"name\":\"") + node->name + "\",\"id\":" + std::to_string(node->id) + "}";
+    return pw_metadata_set_property(rack.metadata, 0, key.c_str(), "Spa:String:JSON", value.c_str()) == 0;
+}
+
+void remember_intercept_target_locked(RunnerRack& rack, bool sink_mode, uint32_t node_id) {
+    const RunnerRack::NodeInfo* node = find_node_by_id(rack, node_id);
+    if (!node) {
+        return;
+    }
+
+    if (sink_mode) {
+        rack.intercepted_sink_id = node->id;
+        rack.intercepted_sink_name = node->name;
+    } else {
+        rack.intercepted_source_id = node->id;
+        rack.intercepted_source_name = node->name;
+    }
+}
+
+void maintain_default_routing_policy_locked(RunnerRack& rack) {
+    const uint32_t rack_node_id = resolve_rack_node_id(rack);
+    if (rack_node_id == PW_ID_ANY) {
+        return;
+    }
+
+    const bool want_sink_ownership = rack.auto_route_default && rack.route_mode == vessel::RackRouteMode::SINK;
+    const bool want_source_ownership = rack.auto_route_default && rack.route_mode == vessel::RackRouteMode::SOURCE;
+
+    const uint32_t observed_sink_id = resolve_default_node_id(rack, true);
+    const uint32_t observed_source_id = resolve_default_node_id(rack, false);
+
+    if (want_sink_ownership) {
+        rack.owns_default_sink = true;
+        if (observed_sink_id != PW_ID_ANY && observed_sink_id != rack_node_id) {
+            remember_intercept_target_locked(rack, true, observed_sink_id);
+        }
+        if (observed_sink_id != rack_node_id) {
+            set_default_node_metadata_locked(rack, true, rack_node_id);
+        }
+    } else if (rack.owns_default_sink) {
+        const uint32_t restore_sink_id = resolve_node_id_by_ref(rack, rack.intercepted_sink_name, rack.intercepted_sink_id);
+        if (restore_sink_id != PW_ID_ANY) {
+            set_default_node_metadata_locked(rack, true, restore_sink_id);
+        }
+        rack.owns_default_sink = false;
+    }
+
+    if (want_source_ownership) {
+        rack.owns_default_source = true;
+        if (observed_source_id != PW_ID_ANY && observed_source_id != rack_node_id) {
+            remember_intercept_target_locked(rack, false, observed_source_id);
+        }
+        if (observed_source_id != rack_node_id) {
+            set_default_node_metadata_locked(rack, false, rack_node_id);
+        }
+    } else if (rack.owns_default_source) {
+        const uint32_t restore_source_id = resolve_node_id_by_ref(rack, rack.intercepted_source_name, rack.intercepted_source_id);
+        if (restore_source_id != PW_ID_ANY) {
+            set_default_node_metadata_locked(rack, false, restore_source_id);
+        }
+        rack.owns_default_source = false;
+    }
+}
+
+uint32_t resolve_intercept_target_node_id(const RunnerRack& rack, bool sink_mode) {
+    if (sink_mode) {
+        const uint32_t id = resolve_node_id_by_ref(rack, rack.intercepted_sink_name, rack.intercepted_sink_id);
+        if (id != PW_ID_ANY) {
+            return id;
+        }
+    } else {
+        const uint32_t id = resolve_node_id_by_ref(rack, rack.intercepted_source_name, rack.intercepted_source_id);
+        if (id != PW_ID_ANY) {
+            return id;
+        }
+    }
+    return resolve_default_node_id(rack, sink_mode);
 }
 
 uint32_t pick_target_port_by_channel(
@@ -463,9 +573,14 @@ void apply_auto_routing_locked(RunnerRack& rack) {
         return;
     }
 
+    maintain_default_routing_policy_locked(rack);
+
     const uint32_t rack_node_id = resolve_rack_node_id(rack);
-    const uint32_t default_node_id = resolve_default_node_id(rack, rack.route_mode == vessel::RackRouteMode::SINK);
+    const uint32_t default_node_id = resolve_intercept_target_node_id(rack, rack.route_mode == vessel::RackRouteMode::SINK);
     if (rack_node_id == PW_ID_ANY || default_node_id == PW_ID_ANY) {
+        return;
+    }
+    if (default_node_id == rack_node_id) {
         return;
     }
 
@@ -1122,9 +1237,11 @@ void bind_default_metadata_locked(RunnerRack& rack, uint32_t id, uint32_t versio
 
             if (std::strcmp(key, "default.audio.sink") == 0) {
                 parse_default_metadata_value(value, rack->default_sink_name, rack->default_sink_id);
+                maintain_default_routing_policy_locked(*rack);
                 apply_auto_routing_locked(*rack);
             } else if (std::strcmp(key, "default.audio.source") == 0) {
                 parse_default_metadata_value(value, rack->default_source_name, rack->default_source_id);
+                maintain_default_routing_policy_locked(*rack);
                 apply_auto_routing_locked(*rack);
             }
             return 0;
@@ -1160,6 +1277,7 @@ const struct pw_registry_events kRegistryEvents = [] {
                 node.media_class = media_class;
             }
             rack->nodes[id] = std::move(node);
+            maintain_default_routing_policy_locked(*rack);
             apply_auto_routing_locked(*rack);
             return;
         }
@@ -1221,6 +1339,7 @@ const struct pw_registry_events kRegistryEvents = [] {
             rack->metadata_global_id = PW_ID_ANY;
         }
 
+        maintain_default_routing_policy_locked(*rack);
         apply_auto_routing_locked(*rack);
     };
     return events;
@@ -1495,6 +1614,7 @@ void handle_messages(RunnerRack& rack, int client_fd, pw_thread_loop* thread_loo
             pw_thread_loop_lock(thread_loop);
             reconfigure_audio_graph(rack, thread_loop, next_mode);
             rack.auto_route_default = msg->auto_route_default != 0;
+            maintain_default_routing_policy_locked(rack);
             apply_auto_routing_locked(rack);
             pw_thread_loop_unlock(thread_loop);
 
