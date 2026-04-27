@@ -39,6 +39,9 @@ enum class ParamWidget : uint8_t {
     SLIDER = 0,
     BUTTON = 1,
     TOGGLE = 2,
+    KNOB = 3,
+    VSLIDER = 4,
+    DRAG = 5,
 };
 
 enum class ParamValueType : uint8_t {

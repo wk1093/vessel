@@ -394,6 +394,42 @@ static void draw_level_meter(const char* label, float level) {
     ImGui::TextUnformatted(label);
 }
 
+bool draw_knob(const char* label, float* value, float min_value, float max_value) {
+    const float knob_size = 46.0f;
+    const float radius = knob_size * 0.5f;
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImVec2 center(pos.x + radius, pos.y + radius);
+
+    ImGui::InvisibleButton("##knob", ImVec2(knob_size, knob_size + ImGui::GetTextLineHeightWithSpacing()));
+
+    bool changed = false;
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        const float range = std::max(0.0001f, max_value - min_value);
+        const float sensitivity = range / 160.0f;
+        *value = std::clamp(*value - ImGui::GetIO().MouseDelta.y * sensitivity, min_value, max_value);
+        changed = true;
+    }
+
+    const float t = (*value - min_value) / std::max(0.0001f, max_value - min_value);
+    const float angle_min = 2.3561945f;
+    const float angle_max = 7.0685835f;
+    const float angle = angle_min + (angle_max - angle_min) * std::clamp(t, 0.0f, 1.0f);
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddCircleFilled(center, radius - 2.0f, IM_COL32(55, 55, 55, 255), 24);
+    draw->AddCircle(center, radius - 2.0f, IM_COL32(120, 120, 120, 255), 24, 2.0f);
+
+    const ImVec2 indicator(
+        center.x + std::cos(angle) * (radius - 8.0f),
+        center.y + std::sin(angle) * (radius - 8.0f));
+    draw->AddLine(center, indicator, IM_COL32(220, 220, 220, 255), 2.0f);
+
+    ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + knob_size + 2.0f));
+    ImGui::TextUnformatted(label);
+
+    return changed;
+}
+
 int main(int, char* argv[]) {
     const std::string runner_binary = get_runner_binary_path(argv[0]);
 
@@ -699,7 +735,19 @@ int main(int, char* argv[]) {
                             int v = static_cast<int>(std::lround(param.value));
                             const int min_v = static_cast<int>(std::lround(param.min_value));
                             const int max_v = std::max(min_v, static_cast<int>(std::lround(param.max_value)));
-                            if (ImGui::SliderInt(param.name.c_str(), &v, min_v, max_v)) {
+
+                            bool changed = false;
+                            if (param.widget == vessel::ParamWidget::VSLIDER) {
+                                changed = ImGui::VSliderInt("##vslider", ImVec2(20.0f, 80.0f), &v, min_v, max_v, "");
+                                ImGui::SameLine();
+                                ImGui::Text("%s: %d", param.name.c_str(), v);
+                            } else if (param.widget == vessel::ParamWidget::DRAG) {
+                                changed = ImGui::DragInt(param.name.c_str(), &v, 1.0f, min_v, max_v);
+                            } else {
+                                changed = ImGui::SliderInt(param.name.c_str(), &v, min_v, max_v);
+                            }
+
+                            if (changed) {
                                 param.value = static_cast<float>(v);
                                 send_param_update(rack, plugin, param, param.value);
                             }
@@ -739,7 +787,22 @@ int main(int, char* argv[]) {
                             if ((param.flags & vessel::PARAM_FLAG_LOGARITHMIC) != 0) {
                                 slider_flags = static_cast<ImGuiSliderFlags>(slider_flags | ImGuiSliderFlags_Logarithmic);
                             }
-                            if (ImGui::SliderFloat(param.name.c_str(), &v, param.min_value, param.max_value, "%.3f", slider_flags)) {
+
+                            bool changed = false;
+                            if (param.widget == vessel::ParamWidget::KNOB) {
+                                changed = draw_knob(param.name.c_str(), &v, param.min_value, param.max_value);
+                            } else if (param.widget == vessel::ParamWidget::VSLIDER) {
+                                changed = ImGui::VSliderFloat("##vslider", ImVec2(20.0f, 80.0f), &v, param.min_value, param.max_value, "");
+                                ImGui::SameLine();
+                                ImGui::Text("%s: %.3f", param.name.c_str(), v);
+                            } else if (param.widget == vessel::ParamWidget::DRAG) {
+                                const float speed = std::max(0.0001f, (param.max_value - param.min_value) / 300.0f);
+                                changed = ImGui::DragFloat(param.name.c_str(), &v, speed, param.min_value, param.max_value, "%.3f", slider_flags);
+                            } else {
+                                changed = ImGui::SliderFloat(param.name.c_str(), &v, param.min_value, param.max_value, "%.3f", slider_flags);
+                            }
+
+                            if (changed) {
                                 param.value = v;
                                 send_param_update(rack, plugin, param, v);
                             }
