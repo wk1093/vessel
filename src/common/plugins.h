@@ -16,6 +16,7 @@ inline constexpr PluginManifestEntry kDefaultPlugins[] = {
     {1, "Sine Mixer (Test)", true, ""},
     {2, "Gain", true, ""},
     {3, "Soft Clip", true, ""},
+    {4, "Soundboard", true, ""},
 };
 
 inline constexpr size_t kDefaultPluginCount = sizeof(kDefaultPlugins) / sizeof(kDefaultPlugins[0]);

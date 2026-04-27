@@ -248,6 +248,8 @@ void send_plugin_param_desc_value(int client_fd, uint32_t instance_id, const Plu
     msg.widget = spec.widget;
     msg.value_type = spec.value_type;
     msg.flags = spec.flags;
+    msg.layout = spec.layout;
+    msg.ui_width = spec.ui_width;
     msg.min_value = spec.min_value;
     msg.max_value = spec.max_value;
     msg.value = value;

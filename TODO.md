@@ -3,7 +3,7 @@
 - [x] Make it so when parameters are changed in the plugin's GUI, the changes are reflected in the host's parameter list. (already works for the other way around, but not from the plugin gui to the host)
 - [x] if possible with LV2, make enum parameters show up as dropdowns with names instead of an integer input field.
 - [x] Add support for more plugin GUI elements for custom plugins (e.g. knobs, buttons, file selectors, etc.)
-- [ ] Create customizable soundboard plugin.
+- [x] Create customizable soundboard plugin.
 - [ ] Add LV2 ui inside of an imgui window instead of a separate window.
 - [ ] Make audio more stable and support more sample rates, buffer sizes, and channel configurations (e.g. mono, stereo, etc).
 - [ ] Add support for LV2 state saving and loading.

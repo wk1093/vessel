@@ -23,6 +23,8 @@ struct PluginParamSpec {
     vessel::ParamValueType value_type{vessel::ParamValueType::FLOAT};
     uint8_t flags{vessel::PARAM_FLAG_NONE};
     std::vector<PluginParamEnumOption> enum_options;
+    vessel::ParamLayoutHint layout{vessel::ParamLayoutHint::AUTO};
+    float ui_width{0.0f};
 };
 
 class RackPlugin {

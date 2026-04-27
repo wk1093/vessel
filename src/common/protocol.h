@@ -57,6 +57,11 @@ enum class ParamValueType : uint8_t {
     ENUM = 3,
 };
 
+enum class ParamLayoutHint : uint8_t {
+    AUTO = 0,
+    SAME_LINE = 1,
+};
+
 enum ParamFlags : uint8_t {
     PARAM_FLAG_NONE = 0,
     PARAM_FLAG_LOGARITHMIC = 1u << 0,
@@ -121,6 +126,8 @@ struct __attribute__((packed)) MsgPluginParamDesc {
     ParamWidget widget{ParamWidget::SLIDER};
     ParamValueType value_type{ParamValueType::FLOAT};
     uint8_t flags{PARAM_FLAG_NONE};
+    ParamLayoutHint layout{ParamLayoutHint::AUTO};
+    float ui_width{0.0f};
     float min_value{0.0f};
     float max_value{1.0f};
     float value{0.0f};

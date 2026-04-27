@@ -43,6 +43,8 @@ struct RackPluginParam {
     vessel::ParamWidget widget = vessel::ParamWidget::SLIDER;
     vessel::ParamValueType value_type = vessel::ParamValueType::FLOAT;
     uint8_t flags = vessel::PARAM_FLAG_NONE;
+    vessel::ParamLayoutHint layout = vessel::ParamLayoutHint::AUTO;
+    float ui_width = 0.0f;
     std::string name;
     float min_value = 0.0f;
     float max_value = 1.0f;
@@ -57,6 +59,7 @@ struct RackPluginInstance {
     bool bypassed = false;
     bool has_custom_ui = false;
     bool is_open = true;
+    bool host_ui_detached = false;
     std::vector<RackPluginParam> params;
 };
 
@@ -235,6 +238,112 @@ void send_param_update(Rack& rack, const RackPluginInstance& plugin, const RackP
     send_ipc(rack, msg);
 }
 
+bool draw_knob(const char* label, float* value, float min_value, float max_value);
+
+void render_plugin_params(Rack& rack, RackPluginInstance& plugin) {
+    for (auto& param : plugin.params) {
+        ImGui::PushID(static_cast<int>(param.param_id));
+
+        if (param.layout == vessel::ParamLayoutHint::SAME_LINE) {
+            ImGui::SameLine();
+        }
+        if (param.ui_width > 0.0f) {
+            ImGui::SetNextItemWidth(param.ui_width);
+        }
+
+        if (param.widget == vessel::ParamWidget::BUTTON) {
+            if (ImGui::Button(param.name.c_str())) {
+                send_param_update(rack, plugin, param, 1.0f);
+            }
+        } else if (param.value_type == vessel::ParamValueType::BOOL
+                   || param.widget == vessel::ParamWidget::TOGGLE) {
+            bool b = param.value > 0.5f;
+            if (ImGui::Checkbox(param.name.c_str(), &b)) {
+                param.value = b ? 1.0f : 0.0f;
+                send_param_update(rack, plugin, param, param.value);
+            }
+        } else if (param.value_type == vessel::ParamValueType::INT
+                   || (param.value_type == vessel::ParamValueType::ENUM && param.enum_options.empty())) {
+            int v = static_cast<int>(std::lround(param.value));
+            const int min_v = static_cast<int>(std::lround(param.min_value));
+            const int max_v = std::max(min_v, static_cast<int>(std::lround(param.max_value)));
+
+            bool changed = false;
+            if (param.widget == vessel::ParamWidget::VSLIDER) {
+                changed = ImGui::VSliderInt("##vslider", ImVec2(20.0f, 80.0f), &v, min_v, max_v, "");
+                ImGui::SameLine();
+                ImGui::Text("%s: %d", param.name.c_str(), v);
+            } else if (param.widget == vessel::ParamWidget::DRAG) {
+                changed = ImGui::DragInt(param.name.c_str(), &v, 1.0f, min_v, max_v);
+            } else {
+                changed = ImGui::SliderInt(param.name.c_str(), &v, min_v, max_v);
+            }
+
+            if (changed) {
+                param.value = static_cast<float>(v);
+                send_param_update(rack, plugin, param, param.value);
+            }
+        } else if (param.value_type == vessel::ParamValueType::ENUM) {
+            int current_value = static_cast<int>(std::lround(param.value));
+            int current_index = -1;
+            for (int i = 0; i < static_cast<int>(param.enum_options.size()); ++i) {
+                if (param.enum_options[static_cast<size_t>(i)].value == current_value) {
+                    current_index = i;
+                    break;
+                }
+            }
+
+            std::string current_label = std::to_string(current_value);
+            if (current_index >= 0) {
+                current_label = param.enum_options[static_cast<size_t>(current_index)].label;
+            }
+
+            if (ImGui::BeginCombo(param.name.c_str(), current_label.c_str())) {
+                for (int i = 0; i < static_cast<int>(param.enum_options.size()); ++i) {
+                    const auto& option = param.enum_options[static_cast<size_t>(i)];
+                    const bool selected = (option.value == current_value);
+                    if (ImGui::Selectable(option.label.c_str(), selected)) {
+                        param.value = static_cast<float>(option.value);
+                        send_param_update(rack, plugin, param, param.value);
+                        current_value = option.value;
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        } else {
+            float v = param.value;
+            ImGuiSliderFlags slider_flags = ImGuiSliderFlags_None;
+            if ((param.flags & vessel::PARAM_FLAG_LOGARITHMIC) != 0) {
+                slider_flags = static_cast<ImGuiSliderFlags>(slider_flags | ImGuiSliderFlags_Logarithmic);
+            }
+
+            bool changed = false;
+            if (param.widget == vessel::ParamWidget::KNOB) {
+                changed = draw_knob(param.name.c_str(), &v, param.min_value, param.max_value);
+            } else if (param.widget == vessel::ParamWidget::VSLIDER) {
+                changed = ImGui::VSliderFloat("##vslider", ImVec2(20.0f, 80.0f), &v, param.min_value, param.max_value, "");
+                ImGui::SameLine();
+                ImGui::Text("%s: %.3f", param.name.c_str(), v);
+            } else if (param.widget == vessel::ParamWidget::DRAG) {
+                const float speed = std::max(0.0001f, (param.max_value - param.min_value) / 300.0f);
+                changed = ImGui::DragFloat(param.name.c_str(), &v, speed, param.min_value, param.max_value, "%.3f", slider_flags);
+            } else {
+                changed = ImGui::SliderFloat(param.name.c_str(), &v, param.min_value, param.max_value, "%.3f", slider_flags);
+            }
+
+            if (changed) {
+                param.value = v;
+                send_param_update(rack, plugin, param, v);
+            }
+        }
+
+        ImGui::PopID();
+    }
+}
+
 RackPluginInstance* find_plugin_instance(Rack& rack, uint32_t instance_id) {
     for (auto& plugin : rack.plugins) {
         if (plugin.instance_id == instance_id) {
@@ -387,6 +496,8 @@ void drain_ipc(Rack& rack) {
                 param_ptr->widget = msg->widget;
                 param_ptr->value_type = msg->value_type;
                 param_ptr->flags = msg->flags;
+                param_ptr->layout = msg->layout;
+                param_ptr->ui_width = msg->ui_width;
                 param_ptr->name = msg->name;
                 param_ptr->min_value = msg->min_value;
                 param_ptr->max_value = msg->max_value;
@@ -767,19 +878,27 @@ int main(int, char* argv[]) {
 
                 const float remove_button_width = ImGui::GetFrameHeight();
                 const float button_spacing = ImGui::GetStyle().ItemSpacing.x;
-                const char* ui_button_label = plugin.is_open ? "Close GUI" : "Open GUI";
-                const float open_button_width = plugin.has_custom_ui ? ImGui::CalcTextSize(ui_button_label).x + ImGui::GetStyle().FramePadding.x * 2.0f : 0.0f;
+                const bool uses_runner_custom_ui = plugin.has_custom_ui;
+                const bool uses_detached_host_ui = !plugin.has_custom_ui;
+                const bool ui_is_open = uses_runner_custom_ui ? plugin.is_open : plugin.host_ui_detached;
+                const char* ui_button_label = ui_is_open ? "Close GUI" : "Open GUI";
+                const bool show_ui_button = uses_runner_custom_ui || uses_detached_host_ui;
+                const float open_button_width = show_ui_button ? ImGui::CalcTextSize(ui_button_label).x + ImGui::GetStyle().FramePadding.x * 2.0f : 0.0f;
                 const float right_edge = ImGui::GetWindowContentRegionMax().x;
 
-                if (plugin.has_custom_ui) {
+                if (show_ui_button) {
                     const float open_button_x = right_edge - remove_button_width - button_spacing - open_button_width;
                     ImGui::SameLine();
                     ImGui::SetCursorPosX(open_button_x);
                     ImGui::SetNextItemAllowOverlap();
                     if (ImGui::Button(ui_button_label)) {
-                        vessel::MsgOpenPluginUi msg;
-                        msg.instance_id = plugin.instance_id;
-                        send_ipc(rack, msg);
+                        if (uses_runner_custom_ui) {
+                            vessel::MsgOpenPluginUi msg;
+                            msg.instance_id = plugin.instance_id;
+                            send_ipc(rack, msg);
+                        } else {
+                            plugin.host_ui_detached = !plugin.host_ui_detached;
+                        }
                     }
                 }
 
@@ -809,99 +928,20 @@ int main(int, char* argv[]) {
                         std::snprintf(preset_file_buf, sizeof(preset_file_buf), "preset-%u.vsp", plugin.instance_id);
                     }
 
-                    for (auto& param : plugin.params) {
-                        ImGui::PushID(static_cast<int>(param.param_id));
+                    if (!plugin.host_ui_detached) {
+                        render_plugin_params(rack, plugin);
+                    }
+                }
 
-                        if (param.widget == vessel::ParamWidget::BUTTON) {
-                            if (ImGui::Button(param.name.c_str())) {
-                                send_param_update(rack, plugin, param, 1.0f);
-                            }
-                        } else if (param.value_type == vessel::ParamValueType::BOOL
-                                   || param.widget == vessel::ParamWidget::TOGGLE) {
-                            bool b = param.value > 0.5f;
-                            if (ImGui::Checkbox(param.name.c_str(), &b)) {
-                                param.value = b ? 1.0f : 0.0f;
-                                send_param_update(rack, plugin, param, param.value);
-                            }
-                        } else if (param.value_type == vessel::ParamValueType::INT
-                                   || (param.value_type == vessel::ParamValueType::ENUM && param.enum_options.empty())) {
-                            int v = static_cast<int>(std::lround(param.value));
-                            const int min_v = static_cast<int>(std::lround(param.min_value));
-                            const int max_v = std::max(min_v, static_cast<int>(std::lround(param.max_value)));
-
-                            bool changed = false;
-                            if (param.widget == vessel::ParamWidget::VSLIDER) {
-                                changed = ImGui::VSliderInt("##vslider", ImVec2(20.0f, 80.0f), &v, min_v, max_v, "");
-                                ImGui::SameLine();
-                                ImGui::Text("%s: %d", param.name.c_str(), v);
-                            } else if (param.widget == vessel::ParamWidget::DRAG) {
-                                changed = ImGui::DragInt(param.name.c_str(), &v, 1.0f, min_v, max_v);
-                            } else {
-                                changed = ImGui::SliderInt(param.name.c_str(), &v, min_v, max_v);
-                            }
-
-                            if (changed) {
-                                param.value = static_cast<float>(v);
-                                send_param_update(rack, plugin, param, param.value);
-                            }
-                        } else if (param.value_type == vessel::ParamValueType::ENUM) {
-                            int current_value = static_cast<int>(std::lround(param.value));
-                            int current_index = -1;
-                            for (int i = 0; i < static_cast<int>(param.enum_options.size()); ++i) {
-                                if (param.enum_options[static_cast<size_t>(i)].value == current_value) {
-                                    current_index = i;
-                                    break;
-                                }
-                            }
-
-                            std::string current_label = std::to_string(current_value);
-                            if (current_index >= 0) {
-                                current_label = param.enum_options[static_cast<size_t>(current_index)].label;
-                            }
-
-                            if (ImGui::BeginCombo(param.name.c_str(), current_label.c_str())) {
-                                for (int i = 0; i < static_cast<int>(param.enum_options.size()); ++i) {
-                                    const auto& option = param.enum_options[static_cast<size_t>(i)];
-                                    const bool selected = (option.value == current_value);
-                                    if (ImGui::Selectable(option.label.c_str(), selected)) {
-                                        param.value = static_cast<float>(option.value);
-                                        send_param_update(rack, plugin, param, param.value);
-                                        current_value = option.value;
-                                    }
-                                    if (selected) {
-                                        ImGui::SetItemDefaultFocus();
-                                    }
-                                }
-                                ImGui::EndCombo();
-                            }
-                        } else {
-                            float v = param.value;
-                            ImGuiSliderFlags slider_flags = ImGuiSliderFlags_None;
-                            if ((param.flags & vessel::PARAM_FLAG_LOGARITHMIC) != 0) {
-                                slider_flags = static_cast<ImGuiSliderFlags>(slider_flags | ImGuiSliderFlags_Logarithmic);
-                            }
-
-                            bool changed = false;
-                            if (param.widget == vessel::ParamWidget::KNOB) {
-                                changed = draw_knob(param.name.c_str(), &v, param.min_value, param.max_value);
-                            } else if (param.widget == vessel::ParamWidget::VSLIDER) {
-                                changed = ImGui::VSliderFloat("##vslider", ImVec2(20.0f, 80.0f), &v, param.min_value, param.max_value, "");
-                                ImGui::SameLine();
-                                ImGui::Text("%s: %.3f", param.name.c_str(), v);
-                            } else if (param.widget == vessel::ParamWidget::DRAG) {
-                                const float speed = std::max(0.0001f, (param.max_value - param.min_value) / 300.0f);
-                                changed = ImGui::DragFloat(param.name.c_str(), &v, speed, param.min_value, param.max_value, "%.3f", slider_flags);
-                            } else {
-                                changed = ImGui::SliderFloat(param.name.c_str(), &v, param.min_value, param.max_value, "%.3f", slider_flags);
-                            }
-
-                            if (changed) {
-                                param.value = v;
-                                send_param_update(rack, plugin, param, v);
-                            }
-                        }
-
-                        ImGui::PopID();
+                if (plugin.host_ui_detached) {
+                    bool detached_open = true;
+                    std::string detached_title = plugin.name + " GUI##detached_" + std::to_string(rack.id) + "_" + std::to_string(plugin.instance_id);
+                    if (ImGui::Begin(detached_title.c_str(), &detached_open)) {
+                        render_plugin_params(rack, plugin);
+                    }
+                    ImGui::End();
+                    if (!detached_open) {
+                        plugin.host_ui_detached = false;
                     }
                 }
 

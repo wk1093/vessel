@@ -1,6 +1,7 @@
 #include "plugins_runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <limits>
@@ -20,6 +21,7 @@ namespace {
 constexpr uint32_t kPluginTypeSineMixer = 1;
 constexpr uint32_t kPluginTypeGain = 2;
 constexpr uint32_t kPluginTypeSoftClip = 3;
+constexpr uint32_t kPluginTypeSoundboard = 4;
 constexpr uint32_t kLv2PluginTypeBase = 10000;
 
 float sanitize_default(float value, float fallback) {
@@ -168,6 +170,279 @@ public:
 
 private:
     std::atomic<float> drive_{1.0f};
+};
+
+class SoundboardPlugin final : public RackPlugin {
+public:
+    static constexpr uint32_t kPadCount = 4;
+    static constexpr uint32_t kSoundCount = 5;
+
+    uint32_t type_id() const override { return kPluginTypeSoundboard; }
+    const char* display_name() const override { return "Soundboard"; }
+
+    float process_sample(float in, float sample_rate, int channel) override {
+        if (channel == 1) {
+            return last_frame_out_;
+        }
+
+        const float sr = std::max(sample_rate, 1.0f);
+        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
+            if (pad_trigger_[pad].exchange(false, std::memory_order_relaxed)) {
+                voices_[pad].active = true;
+                voices_[pad].sound = std::clamp(sound_select_[pad].load(std::memory_order_relaxed), 0, static_cast<int>(kSoundCount - 1));
+                voices_[pad].time = 0.0f;
+                voices_[pad].phase = 0.0f;
+            }
+        }
+
+        float board = 0.0f;
+        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
+            const float gain = pad_gain_[pad].load(std::memory_order_relaxed);
+            board += render_voice(voices_[pad], sr) * gain;
+        }
+
+        const float mixed = in + board * master_mix_.load(std::memory_order_relaxed);
+        last_frame_out_ = mixed;
+        return mixed;
+    }
+
+    std::vector<PluginParamSpec> param_specs() const override {
+        std::vector<PluginParamSpec> out;
+        out.reserve(1 + (kPadCount * 3));
+
+        out.push_back({
+            kParamMasterMix,
+            "Master Mix",
+            vessel::ParamWidget::KNOB,
+            0.0f,
+            1.0f,
+            0.8f,
+            vessel::ParamValueType::FLOAT,
+            vessel::PARAM_FLAG_NONE,
+            {},
+            vessel::ParamLayoutHint::AUTO,
+            0.0f,
+        });
+
+        const auto options = sound_options();
+        for (uint32_t pad = 0; pad < kPadCount; ++pad) {
+            out.push_back({
+                pad_trigger_param_id(pad),
+                kPadTriggerNames[pad],
+                vessel::ParamWidget::BUTTON,
+                0.0f,
+                1.0f,
+                0.0f,
+                vessel::ParamValueType::BOOL,
+                vessel::PARAM_FLAG_NONE,
+                {},
+                vessel::ParamLayoutHint::AUTO,
+                0.0f,
+            });
+            out.push_back({
+                pad_sound_param_id(pad),
+                kPadSoundNames[pad],
+                vessel::ParamWidget::SLIDER,
+                0.0f,
+                static_cast<float>(kSoundCount - 1),
+                static_cast<float>(pad % kSoundCount),
+                vessel::ParamValueType::ENUM,
+                vessel::PARAM_FLAG_NONE,
+                options,
+                vessel::ParamLayoutHint::SAME_LINE,
+                170.0f,
+            });
+            out.push_back({
+                pad_gain_param_id(pad),
+                kPadGainNames[pad],
+                vessel::ParamWidget::KNOB,
+                0.0f,
+                1.0f,
+                0.75f,
+                vessel::ParamValueType::FLOAT,
+                vessel::PARAM_FLAG_NONE,
+                {},
+                vessel::ParamLayoutHint::SAME_LINE,
+                0.0f,
+            });
+        }
+
+        return out;
+    }
+
+    float get_param(uint32_t param_id) const override {
+        if (param_id == kParamMasterMix) {
+            return master_mix_.load(std::memory_order_relaxed);
+        }
+
+        uint32_t pad = 0;
+        if (param_id_to_pad(param_id, pad)) {
+            if (param_id == pad_trigger_param_id(pad)) {
+                return 0.0f;
+            }
+            if (param_id == pad_sound_param_id(pad)) {
+                return static_cast<float>(sound_select_[pad].load(std::memory_order_relaxed));
+            }
+            if (param_id == pad_gain_param_id(pad)) {
+                return pad_gain_[pad].load(std::memory_order_relaxed);
+            }
+        }
+
+        return 0.0f;
+    }
+
+    void set_param(uint32_t param_id, float value) override {
+        if (param_id == kParamMasterMix) {
+            master_mix_.store(std::clamp(value, 0.0f, 1.0f), std::memory_order_relaxed);
+            return;
+        }
+
+        uint32_t pad = 0;
+        if (!param_id_to_pad(param_id, pad)) {
+            return;
+        }
+
+        if (param_id == pad_trigger_param_id(pad)) {
+            if (value > 0.5f) {
+                pad_trigger_[pad].store(true, std::memory_order_relaxed);
+            }
+            return;
+        }
+        if (param_id == pad_sound_param_id(pad)) {
+            const int sound = std::clamp(static_cast<int>(std::lround(value)), 0, static_cast<int>(kSoundCount - 1));
+            sound_select_[pad].store(sound, std::memory_order_relaxed);
+            return;
+        }
+        if (param_id == pad_gain_param_id(pad)) {
+            pad_gain_[pad].store(std::clamp(value, 0.0f, 1.0f), std::memory_order_relaxed);
+            return;
+        }
+    }
+
+private:
+    struct Voice {
+        bool active = false;
+        int sound = 0;
+        float time = 0.0f;
+        float phase = 0.0f;
+    };
+
+    static constexpr uint32_t kParamMasterMix = 1;
+    static constexpr uint32_t kParamBase = 2;
+    static constexpr uint32_t kParamsPerPad = 3;
+
+    static constexpr const char* kPadTriggerNames[kPadCount] = {
+        "Pad A Trigger",
+        "Pad B Trigger",
+        "Pad C Trigger",
+        "Pad D Trigger",
+    };
+
+    static constexpr const char* kPadSoundNames[kPadCount] = {
+        "Pad A Sound",
+        "Pad B Sound",
+        "Pad C Sound",
+        "Pad D Sound",
+    };
+
+    static constexpr const char* kPadGainNames[kPadCount] = {
+        "Pad A Gain",
+        "Pad B Gain",
+        "Pad C Gain",
+        "Pad D Gain",
+    };
+
+    static std::vector<PluginParamEnumOption> sound_options() {
+        return {
+            {0, "Kick"},
+            {1, "Snare"},
+            {2, "Hi-Hat"},
+            {3, "Clap"},
+            {4, "Beep"},
+        };
+    }
+
+    static uint32_t pad_trigger_param_id(uint32_t pad) {
+        return kParamBase + (pad * kParamsPerPad);
+    }
+
+    static uint32_t pad_sound_param_id(uint32_t pad) {
+        return pad_trigger_param_id(pad) + 1;
+    }
+
+    static uint32_t pad_gain_param_id(uint32_t pad) {
+        return pad_trigger_param_id(pad) + 2;
+    }
+
+    static bool param_id_to_pad(uint32_t param_id, uint32_t& pad_out) {
+        if (param_id < kParamBase) {
+            return false;
+        }
+        const uint32_t rel = param_id - kParamBase;
+        pad_out = rel / kParamsPerPad;
+        return pad_out < kPadCount;
+    }
+
+    float next_noise() {
+        noise_state_ = noise_state_ * 1664525u + 1013904223u;
+        const uint32_t x = (noise_state_ >> 8) & 0x00FFFFFFu;
+        return (static_cast<float>(x) / 8388607.5f) - 1.0f;
+    }
+
+    float render_voice(Voice& v, float sample_rate) {
+        if (!v.active) {
+            return 0.0f;
+        }
+
+        const float dt = 1.0f / sample_rate;
+        const float t = v.time;
+        float sample = 0.0f;
+
+        if (v.sound == 0) {
+            const float env = std::exp(-8.0f * t);
+            const float freq = 40.0f + 120.0f * std::exp(-10.0f * t);
+            v.phase += (2.0f * 3.14159265358979323846f * freq) * dt;
+            sample = std::sin(v.phase) * env;
+            v.active = t < 0.7f;
+        } else if (v.sound == 1) {
+            const float env = std::exp(-14.0f * t);
+            v.phase += (2.0f * 3.14159265358979323846f * 200.0f) * dt;
+            sample = (next_noise() * 0.8f + std::sin(v.phase) * 0.2f) * env;
+            v.active = t < 0.45f;
+        } else if (v.sound == 2) {
+            const float env = std::exp(-38.0f * t);
+            sample = next_noise() * env;
+            v.active = t < 0.2f;
+        } else if (v.sound == 3) {
+            float env = 0.0f;
+            if (t < 0.03f) {
+                env = 1.0f - (t / 0.03f);
+            } else if (t < 0.06f) {
+                env = 1.0f - ((t - 0.03f) / 0.03f);
+            } else if (t < 0.10f) {
+                env = 1.0f - ((t - 0.06f) / 0.04f);
+            }
+            sample = next_noise() * env * 0.9f;
+            v.active = t < 0.12f;
+        } else {
+            const float env = std::exp(-6.0f * t);
+            v.phase += (2.0f * 3.14159265358979323846f * 880.0f) * dt;
+            sample = std::sin(v.phase) * env;
+            v.active = t < 0.7f;
+        }
+
+        v.time += dt;
+        return sample;
+    }
+
+    std::atomic<float> master_mix_{0.8f};
+    std::array<std::atomic<int>, kPadCount> sound_select_{{0, 1, 2, 4}};
+    std::array<std::atomic<float>, kPadCount> pad_gain_{{0.75f, 0.75f, 0.65f, 0.75f}};
+    std::array<std::atomic<bool>, kPadCount> pad_trigger_{{false, false, false, false}};
+
+    std::array<Voice, kPadCount> voices_{};
+    uint32_t noise_state_ = 0x6A09E667u;
+    float last_frame_out_ = 0.0f;
 };
 
 class Lv2RackPlugin final : public RackPlugin {
@@ -687,6 +962,8 @@ std::unique_ptr<RackPlugin> create_plugin(uint32_t plugin_type_id) {
             return std::make_unique<GainPlugin>();
         case kPluginTypeSoftClip:
             return std::make_unique<SoftClipPlugin>();
+        case kPluginTypeSoundboard:
+            return std::make_unique<SoundboardPlugin>();
         default:
             break;
     }
