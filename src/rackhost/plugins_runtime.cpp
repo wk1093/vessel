@@ -79,8 +79,8 @@ public:
 
     std::vector<PluginParamSpec> param_specs() const override {
         return {
-            {kParamInputVol, "Input Vol", vessel::ParamWidget::SLIDER, 0.0f, 2.0f, 1.0f},
-            {kParamSineVol, "Sine Vol", vessel::ParamWidget::SLIDER, 0.0f, 1.0f, 0.0f},
+            {kParamInputVol, "Input Vol", vessel::ParamWidget::SLIDER, 0.0f, 2.0f, 1.0f, vessel::ParamValueType::FLOAT, vessel::PARAM_FLAG_NONE, {}},
+            {kParamSineVol, "Sine Vol", vessel::ParamWidget::SLIDER, 0.0f, 1.0f, 0.0f, vessel::ParamValueType::FLOAT, vessel::PARAM_FLAG_NONE, {}},
         };
     }
 
@@ -117,7 +117,7 @@ public:
 
     std::vector<PluginParamSpec> param_specs() const override {
         return {
-            {kParamGain, "Gain", vessel::ParamWidget::SLIDER, 0.0f, 2.0f, 1.0f},
+            {kParamGain, "Gain", vessel::ParamWidget::SLIDER, 0.0f, 2.0f, 1.0f, vessel::ParamValueType::FLOAT, vessel::PARAM_FLAG_NONE, {}},
         };
     }
 
@@ -151,7 +151,7 @@ public:
 
     std::vector<PluginParamSpec> param_specs() const override {
         return {
-            {kParamDrive, "Drive", vessel::ParamWidget::SLIDER, 0.1f, 8.0f, 1.0f},
+            {kParamDrive, "Drive", vessel::ParamWidget::SLIDER, 0.1f, 8.0f, 1.0f, vessel::ParamValueType::FLOAT, vessel::PARAM_FLAG_NONE, {}},
         };
     }
 
@@ -292,6 +292,48 @@ public:
                     p.min_value,
                     p.max_value);
                 p.value = p.default_value;
+
+                if (p.value_type == vessel::ParamValueType::ENUM) {
+                    LilvScalePoints* scale_points = lilv_port_get_scale_points(plugin_, port);
+                    if (scale_points) {
+                        LILV_FOREACH(scale_points, sit, scale_points) {
+                            const LilvScalePoint* point = lilv_scale_points_get(scale_points, sit);
+                            if (!point) {
+                                continue;
+                            }
+
+                            const LilvNode* value_node = lilv_scale_point_get_value(point);
+                            const LilvNode* label_node = lilv_scale_point_get_label(point);
+                            if (!value_node || !label_node) {
+                                continue;
+                            }
+
+                            const int enum_value = static_cast<int>(std::lround(lilv_node_as_float(value_node)));
+                            const char* raw_label = lilv_node_as_string(label_node);
+                            const std::string label = raw_label ? raw_label : std::to_string(enum_value);
+
+                            bool duplicate = false;
+                            for (const auto& existing : p.enum_options) {
+                                if (existing.value == enum_value) {
+                                    duplicate = true;
+                                    break;
+                                }
+                            }
+                            if (!duplicate) {
+                                p.enum_options.push_back({enum_value, label});
+                            }
+                        }
+                        lilv_scale_points_free(scale_points);
+                    }
+
+                    std::sort(
+                        p.enum_options.begin(),
+                        p.enum_options.end(),
+                        [](const PluginParamEnumOption& a, const PluginParamEnumOption& b) {
+                            return a.value < b.value;
+                        });
+                }
+
                 controls_.push_back(std::move(p));
             }
         }
@@ -391,6 +433,7 @@ public:
                 p.default_value,
                 p.value_type,
                 p.flags,
+                p.enum_options,
             });
         }
         return out;
@@ -594,6 +637,7 @@ private:
         vessel::ParamWidget widget = vessel::ParamWidget::SLIDER;
         vessel::ParamValueType value_type = vessel::ParamValueType::FLOAT;
         uint8_t flags = vessel::PARAM_FLAG_NONE;
+        std::vector<PluginParamEnumOption> enum_options;
         float min_value = 0.0f;
         float max_value = 1.0f;
         float default_value = 0.0f;

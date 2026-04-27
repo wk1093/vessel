@@ -156,6 +156,23 @@ void send_plugin_param_desc_value(int client_fd, uint32_t instance_id, const Plu
     send_ipc(client_fd, msg);
 }
 
+void send_plugin_param_enum_options(int client_fd, uint32_t instance_id, const PluginParamSpec& spec) {
+    if (spec.value_type != vessel::ParamValueType::ENUM || spec.enum_options.empty()) {
+        return;
+    }
+
+    for (size_t i = 0; i < spec.enum_options.size(); ++i) {
+        vessel::MsgPluginParamEnumOption msg;
+        msg.instance_id = instance_id;
+        msg.param_id = spec.id;
+        msg.enum_value = spec.enum_options[i].value;
+        std::strncpy(msg.label, spec.enum_options[i].label.c_str(), vessel::kMaxParamNameLen);
+        msg.label[vessel::kMaxParamNameLen] = '\0';
+        msg.is_last = (i + 1 == spec.enum_options.size()) ? 1 : 0;
+        send_ipc(client_fd, msg);
+    }
+}
+
 void refresh_plugin_param_cache(PluginInstance& instance) {
     instance.param_specs = instance.plugin->param_specs();
     instance.last_param_values.clear();
@@ -219,6 +236,7 @@ void send_plugin_params(int client_fd, uint32_t instance_id, RackPlugin& plugin)
     for (size_t i = 0; i < specs.size(); ++i) {
         const float value = plugin.get_param(specs[i].id);
         send_plugin_param_desc_value(client_fd, instance_id, specs[i], value, (i + 1 == specs.size()) ? 1 : 0);
+        send_plugin_param_enum_options(client_fd, instance_id, specs[i]);
     }
 }
 

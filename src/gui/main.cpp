@@ -32,6 +32,11 @@ struct RackPluginType {
 };
 
 struct RackPluginParam {
+    struct EnumOption {
+        int value = 0;
+        std::string label;
+    };
+
     uint32_t param_id = 0;
     vessel::ParamWidget widget = vessel::ParamWidget::SLIDER;
     vessel::ParamValueType value_type = vessel::ParamValueType::FLOAT;
@@ -40,6 +45,7 @@ struct RackPluginParam {
     float min_value = 0.0f;
     float max_value = 1.0f;
     float value = 0.0f;
+    std::vector<EnumOption> enum_options;
 };
 
 struct RackPluginInstance {
@@ -317,6 +323,37 @@ void drain_ipc(Rack& rack) {
                 param_ptr->min_value = msg->min_value;
                 param_ptr->max_value = msg->max_value;
                 param_ptr->value = msg->value;
+            }
+        } else if (hdr->type == vessel::MsgType::PLUGIN_PARAM_ENUM_OPTION
+                   && frame_size == sizeof(vessel::MsgPluginParamEnumOption)) {
+            const auto* msg = reinterpret_cast<const vessel::MsgPluginParamEnumOption*>(frame);
+            RackPluginInstance* plugin = find_plugin_instance(rack, msg->instance_id);
+            if (plugin) {
+                for (auto& param : plugin->params) {
+                    if (param.param_id != msg->param_id) {
+                        continue;
+                    }
+
+                    bool updated = false;
+                    for (auto& option : param.enum_options) {
+                        if (option.value == msg->enum_value) {
+                            option.label = msg->label;
+                            updated = true;
+                            break;
+                        }
+                    }
+                    if (!updated) {
+                        param.enum_options.push_back({msg->enum_value, msg->label});
+                    }
+
+                    std::sort(
+                        param.enum_options.begin(),
+                        param.enum_options.end(),
+                        [](const RackPluginParam::EnumOption& a, const RackPluginParam::EnumOption& b) {
+                            return a.value < b.value;
+                        });
+                    break;
+                }
             }
         }
 
@@ -658,13 +695,43 @@ int main(int, char* argv[]) {
                                 send_param_update(rack, plugin, param, param.value);
                             }
                         } else if (param.value_type == vessel::ParamValueType::INT
-                                   || param.value_type == vessel::ParamValueType::ENUM) {
+                                   || (param.value_type == vessel::ParamValueType::ENUM && param.enum_options.empty())) {
                             int v = static_cast<int>(std::lround(param.value));
                             const int min_v = static_cast<int>(std::lround(param.min_value));
                             const int max_v = std::max(min_v, static_cast<int>(std::lround(param.max_value)));
                             if (ImGui::SliderInt(param.name.c_str(), &v, min_v, max_v)) {
                                 param.value = static_cast<float>(v);
                                 send_param_update(rack, plugin, param, param.value);
+                            }
+                        } else if (param.value_type == vessel::ParamValueType::ENUM) {
+                            int current_value = static_cast<int>(std::lround(param.value));
+                            int current_index = -1;
+                            for (int i = 0; i < static_cast<int>(param.enum_options.size()); ++i) {
+                                if (param.enum_options[static_cast<size_t>(i)].value == current_value) {
+                                    current_index = i;
+                                    break;
+                                }
+                            }
+
+                            std::string current_label = std::to_string(current_value);
+                            if (current_index >= 0) {
+                                current_label = param.enum_options[static_cast<size_t>(current_index)].label;
+                            }
+
+                            if (ImGui::BeginCombo(param.name.c_str(), current_label.c_str())) {
+                                for (int i = 0; i < static_cast<int>(param.enum_options.size()); ++i) {
+                                    const auto& option = param.enum_options[static_cast<size_t>(i)];
+                                    const bool selected = (option.value == current_value);
+                                    if (ImGui::Selectable(option.label.c_str(), selected)) {
+                                        param.value = static_cast<float>(option.value);
+                                        send_param_update(rack, plugin, param, param.value);
+                                        current_value = option.value;
+                                    }
+                                    if (selected) {
+                                        ImGui::SetItemDefaultFocus();
+                                    }
+                                }
+                                ImGui::EndCombo();
                             }
                         } else {
                             float v = param.value;

@@ -3,9 +3,15 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "protocol.h"
+
+struct PluginParamEnumOption {
+    int value;
+    std::string label;
+};
 
 struct PluginParamSpec {
     uint32_t id;
@@ -16,6 +22,7 @@ struct PluginParamSpec {
     float default_value;
     vessel::ParamValueType value_type{vessel::ParamValueType::FLOAT};
     uint8_t flags{vessel::PARAM_FLAG_NONE};
+    std::vector<PluginParamEnumOption> enum_options;
 };
 
 class RackPlugin {

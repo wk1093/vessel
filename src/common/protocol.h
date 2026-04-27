@@ -32,6 +32,7 @@ enum class MsgType : uint8_t {
     LV2_CATALOG_ENTRY    = 0x1B,  // runner -> GUI
     OPEN_PLUGIN_UI       = 0x1C,  // GUI -> runner
     PLUGIN_UI_STATE      = 0x1D,  // runner -> GUI
+    PLUGIN_PARAM_ENUM_OPTION = 0x1E, // runner -> GUI
 };
 
 enum class ParamWidget : uint8_t {
@@ -162,6 +163,15 @@ struct __attribute__((packed)) MsgPluginUiState {
     MsgHeader hdr{MsgType::PLUGIN_UI_STATE, sizeof(MsgPluginUiState)};
     uint32_t instance_id{0};
     uint8_t is_open{0};
+};
+
+struct __attribute__((packed)) MsgPluginParamEnumOption {
+    MsgHeader hdr{MsgType::PLUGIN_PARAM_ENUM_OPTION, sizeof(MsgPluginParamEnumOption)};
+    uint32_t instance_id{0};
+    uint32_t param_id{0};
+    int32_t enum_value{0};
+    char label[kMaxParamNameLen + 1]{};
+    uint8_t is_last{0};
 };
 
 }  // namespace vessel
