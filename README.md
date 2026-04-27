@@ -262,3 +262,17 @@ src/
 ## Status
 
 Vessel is usable as an experimental PipeWire plugin host and rack workflow prototype, with a focus on low-latency Linux desktop workflows.
+
+## Third-Party Software
+
+Vessel is made possible by these great open-source projects:
+* **Dear ImGui** - UI layout and widgets.
+* **PipeWire & libspa** - Low-latency audio infrastructure.
+* **Lilv & Suil** - LV2 plugin discovery and UI hosting.
+* **GLFW & GLAD** - Window management and OpenGL loading.
+
+## License
+
+This project is licensed under the **MIT License**. 
+
+If you use Vessel in your own project, integrate the runner into your workflow, or build custom plugins for it, I'd love to hear about it! Open an issue or reach out—I'm always interested in seeing how people use the rack architecture.
